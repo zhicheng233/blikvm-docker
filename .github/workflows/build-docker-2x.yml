@@ -27,6 +27,10 @@ on:
         description: '构建成功后推送到 GHCR'
         type: boolean
         default: true
+      probe-native:
+        description: '只编译探测原生模块（不构建完整镜像）'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -62,7 +66,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # x86_64 runner 需要 QEMU 才能在 Dockerfile 里执行 armhf 的 RUN 指令
+      # ---------------------------------------------------------------------
+      # 探测模式：只验证那几个没有预编译产物的原生模块能否在 armhf 上编译，
+      # 不构建发布镜像。用于在决定「编译还是替换」之前先把事实问清楚。
+      # ---------------------------------------------------------------------
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
         with:
@@ -70,6 +77,33 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+
+      - name: Probe native module builds
+        if: inputs.probe-native
+        uses: docker/build-push-action@v6
+        with:
+          context: docker-2x
+          file: docker-2x/tests/Dockerfile.probe
+          platforms: linux/arm/v7
+          load: true
+          tags: blikvm-probe:test
+          build-args: |
+            BLIKVM_REF=${{ env.UPSTREAM_REF }}
+          cache-from: type=gha,scope=blikvm-2x-probe
+          cache-to: type=gha,mode=max,scope=blikvm-2x-probe
+
+      - name: Report probe results
+        if: inputs.probe-native
+        run: |
+          set -eu
+          docker run --rm --platform linux/arm/v7 --entrypoint bash \
+            blikvm-probe:test /probe.sh 2>&1 | tee probe.txt
+          {
+            echo "### armhf 原生模块编译探测"
+            echo '```'
+            cat probe.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Decide whether to push
         id: gate
@@ -112,6 +146,7 @@ jobs:
       # 只构建一次：先 load 到本地跑冒烟测试，通过后再 push。
       # npm install 与原生模块编译在 QEMU 下很慢，缓存对迭代速度很关键。
       - name: Build image
+        if: ${{ !inputs.probe-native }}
         uses: docker/build-push-action@v6
         with:
           context: docker-2x
@@ -127,6 +162,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=blikvm-2x-armhf
 
       - name: Verify image contents
+        if: ${{ !inputs.probe-native }}
         run: |
           set -eu
           # 必须覆盖 ENTRYPOINT，否则 entrypoint.sh 会忽略这里的参数直接拉起服务
@@ -135,6 +171,7 @@ jobs:
             --entrypoint bash "$LOCAL_TAG" /verify/verify-image.sh
 
       - name: Verify entrypoint reports missing hardware
+        if: ${{ !inputs.probe-native }}
         run: |
           set -eu
           # 没有 /dev/video* 且没有 UDC 时，入口必须给出可读的报错而不是崩溃栈
@@ -148,7 +185,7 @@ jobs:
           fi
 
       - name: Tag and push
-        if: steps.gate.outputs.push == 'true'
+        if: ${{ !inputs.probe-native && steps.gate.outputs.push == 'true' }}
         env:
           TAGS: ${{ steps.meta.outputs.tags }}
         run: |
@@ -162,6 +199,7 @@ jobs:
       # 目标板（OneCloud）跨境拉 GHCR 实测只有几十 KB/s，镜像几乎拉不下来。
       # 导出成 tar.zst 当 artifact 走局域网，比反复重试 pull 可靠得多。
       - name: Export image tarball
+        if: ${{ !inputs.probe-native }}
         run: |
           set -eu
           out="blikvm-2x-armhf.tar.zst"
@@ -170,7 +208,7 @@ jobs:
           sha256sum "$out" | tee "$out.sha256"
 
       - name: Upload image tarball
-        if: github.event_name != 'pull_request'
+        if: ${{ !inputs.probe-native && github.event_name != 'pull_request' }}
         uses: actions/upload-artifact@v4
         with:
           name: blikvm-2x-armhf-image
@@ -181,6 +219,7 @@ jobs:
           compression-level: 0
 
       - name: Summary
+        if: ${{ !inputs.probe-native }}
         run: |
           {
             echo "### BliKVM 2.x armhf"
