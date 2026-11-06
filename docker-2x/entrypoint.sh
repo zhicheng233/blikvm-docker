@@ -96,7 +96,7 @@ fi
 # ---------------------------------------------------------------------------
 cd "$APP_DIR"
 missing=""
-for m in serialport i2c-bus bcrypt; do
+for m in serialport i2c-bus bcrypt evdev; do
     if [ ! -d "node_modules/$m" ] && [ ! -d "/usr/lib/nodejs/$m" ]; then
         missing="$missing $m"
     fi

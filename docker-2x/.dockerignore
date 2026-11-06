@@ -1,0 +1,7 @@
+# 构建上下文只需要 Dockerfile、脚本和补丁；
+# README 与测试不参与构建，避免无谓的缓存失效。
+README.md
+tests/
+.build/
+upstream/
+*.log

@@ -29,8 +29,15 @@ WORKDIR /src
 # 只取需要的源码，避免把 .git 历史带进镜像
 # 注意：上游仓库含约 30MB 的预编译二进制（lib/ 下的 janus/ustreamer/ventoy），
 # 必须完整克隆，不能稀疏检出，否则 lib/kvmd-video.sh 等脚本会缺失。
-RUN git clone --depth 1 ${BLIKVM_REF:+--branch ${BLIKVM_REF}} "$BLIKVM_REPO" blikvm \
-    && rm -rf blikvm/.git
+#
+# BLIKVM_REF 可以是分支、tag 或完整 commit SHA；为空的默认与上游一致用 master。
+# SHA 无法用 --branch 检出，所以统一走 fetch + checkout，并对浅取失败做回退。
+RUN git init --quiet blikvm && cd blikvm \
+    && git remote add origin "$BLIKVM_REPO" \
+    && { git fetch --depth 1 origin "${BLIKVM_REF:-master}" \
+         || git fetch origin "${BLIKVM_REF:-master}"; } \
+    && git checkout --quiet --detach FETCH_HEAD \
+    && cd /src && rm -rf blikvm/.git
 
 # 补丁脚本与适配版视频脚本
 COPY patches/ /opt/patches/
@@ -51,13 +58,13 @@ RUN /opt/patches/apply-patches.sh /src/blikvm
 #   serialport  - 串口功能（核心）
 #   i2c-bus     - EEPROM 读板型（非官方板用不到，但 import 链会加载）
 #   bcrypt      - 账号密码哈希（核心，缺失会导致无法登录）
-#   evdev       - HID passthrough（可选功能）
+#   evdev       - HID passthrough；src/index.js 无条件 import，缺失会导致启动崩溃
 #
 # ffi-napi / ref-napi 在本项目源码中未被 import，且在新版 Node 上
 # 已知编译失败（它们最后维护于 Node 16 时代）。跳过它们以避免构建中断。
 WORKDIR /src/blikvm
 RUN npm install --omit=dev --no-audit --no-fund --ignore-scripts \
-    && npm rebuild bcrypt serialport i2c-bus --build-from-source \
+    && npm rebuild bcrypt serialport i2c-bus evdev --build-from-source \
     && npm cache clean --force 2>/dev/null || true
 
 # ---------------------------------------------------------------------------

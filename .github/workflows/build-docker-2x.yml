@@ -1,0 +1,226 @@
+name: Build BliKVM 2.x armhf image
+
+# 为什么在 CI 里构建：
+#   目标是 armhf（arm/v7），而本地开发机和目标板都不适合当构建机：
+#   - OneCloud 只有 1 GB 内存、6 GB 剩余磁盘，拉 Docker Hub 还需要代理
+#   - bcrypt / serialport / i2c-bus 需要在 armhf 上现场编译，要完整工具链
+#   GitHub 的 x86_64 runner 通过 QEMU binfmt 可以执行 armhf 用户态，
+#   外网不受限，产出的镜像推到 GHCR 后由目标板直接拉取。
+
+on:
+  push:
+    branches: [docker-2x]
+    paths:
+      - 'docker-2x/**'
+      - '.github/workflows/build-docker-2x.yml'
+  pull_request:
+    paths:
+      - 'docker-2x/**'
+      - '.github/workflows/build-docker-2x.yml'
+  workflow_dispatch:
+    inputs:
+      upstream-ref:
+        description: 'blikvm-web-server 的 commit / branch / tag'
+        required: false
+        default: ''
+      push-image:
+        description: '构建成功后推送到 GHCR'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-docker-2x-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  patch-tests:
+    name: Patch logic tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      # 纯逻辑测试，不依赖 Docker，先在便宜的 runner 上挡住补丁回归
+      - name: Run patch logic tests
+        run: node --test docker-2x/tests/patch-logic.test.mjs
+
+  image:
+    name: Build, verify and publish
+    needs: patch-tests
+    runs-on: ubuntu-24.04
+    env:
+      # 上游源码固定在 2025-12-18 的 master 提交，避免构建结果随时间漂移。
+      # 升级时同步更新这里与 docker-2x/README.md 中的记录。
+      UPSTREAM_REF: ${{ inputs.upstream-ref || 'cecede74ebe75239576c5eebf2eed7c4003a26fa' }}
+      IMAGE: ghcr.io/${{ github.repository_owner }}/blikvm-2x-armhf
+      LOCAL_TAG: blikvm-2x:ci
+    steps:
+      - uses: actions/checkout@v4
+
+      # x86_64 runner 需要 QEMU 才能在 Dockerfile 里执行 armhf 的 RUN 指令
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Decide whether to push
+        id: gate
+        env:
+          EVENT: ${{ github.event_name }}
+          WANT: ${{ inputs.push-image }}
+        run: |
+          if [ "$EVENT" = "pull_request" ]; then
+            echo "PR 只验证能编译通过，不推送镜像"
+            echo "push=false" >> "$GITHUB_OUTPUT"
+          elif [ "$EVENT" = "workflow_dispatch" ] && [ "$WANT" = "false" ]; then
+            echo "手动触发且选择不推送"
+            echo "push=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "push=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log in to GHCR
+        if: steps.gate.outputs.push == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=2.x-armhf
+            type=sha,prefix=2.x-armhf-,format=short
+          labels: |
+            org.opencontainers.image.title=BliKVM 2.x (armhf, generic ARM)
+            org.opencontainers.image.description=BliKVM 2.x containerized for generic ARM boards without hardware H.264 encoding
+            org.opencontainers.image.licenses=GPL-3.0-only
+            io.blikvm.upstream.ref=${{ env.UPSTREAM_REF }}
+
+      # 只构建一次：先 load 到本地跑冒烟测试，通过后再 push。
+      # npm install 与原生模块编译在 QEMU 下很慢，缓存对迭代速度很关键。
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: docker-2x
+          # 目标就是 armhf，与 Dockerfile 里的 arm32v7/debian 匹配
+          platforms: linux/arm/v7
+          load: true
+          push: false
+          tags: ${{ env.LOCAL_TAG }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            BLIKVM_REF=${{ env.UPSTREAM_REF }}
+          cache-from: type=gha,scope=blikvm-2x-armhf
+          cache-to: type=gha,mode=max,scope=blikvm-2x-armhf
+
+      - name: Verify image contents
+        run: |
+          set -eu
+          # 必须覆盖 ENTRYPOINT，否则 entrypoint.sh 会忽略这里的参数直接拉起服务
+          docker run --rm --platform linux/arm/v7 --entrypoint bash "$LOCAL_TAG" -lc '
+            set -u
+            rc=0
+            report() { echo "FAIL: $*"; rc=1; }
+            ok()     { echo "ok:   $*"; }
+
+            # 补丁必须真的落进镜像，否则运行时会退回上游的板型白名单
+            grep -q "GENERIC" /opt/blikvm/src/common/enums.js \
+              && ok "enums.js 有 GENERIC" || report "enums.js 缺少 GENERIC"
+            grep -q "hasV4L2Capture" /opt/blikvm/src/common/tool.js \
+              && ok "tool.js 已补丁" || report "tool.js 未打补丁"
+            grep -q "generic" /opt/blikvm/src/modules/update/app_default_config.js \
+              && ok "app_default_config 已补丁" || report "app_default_config.js 未打补丁"
+            grep -q "pick_capture_device" /opt/blikvm/lib/kvmd-video.sh \
+              && ok "kvmd-video.sh 已替换" || report "kvmd-video.sh 未替换"
+
+            # 补丁后的 JS 必须能通过语法检查
+            for f in src/common/enums.js src/common/tool.js src/modules/update/app_default_config.js; do
+              node --check "/opt/blikvm/$f" && ok "$f 语法正常" || report "$f 语法错误"
+            done
+
+            # 原生模块必须是 armhf 的 ELF (e_machine=40/EM_ARM) 且能真正 require。
+            # 用 node 读 ELF 头，避免为了 readelf 往 slim 镜像里塞 binutils。
+            for m in bcrypt serialport i2c-bus evdev; do
+              d=/opt/blikvm/node_modules/$m
+              [ -d "$d" ] || { report "$m 未安装"; continue; }
+              f=$(find "$d" -name "*.node" -type f | head -1)
+              [ -n "$f" ] || { report "$m 没有 .node 产物"; continue; }
+              node -e "
+                const fs = require(\"fs\");
+                const b = fs.readFileSync(process.argv[1]);
+                const m = b.readUInt16LE(18);
+                if (m !== 40) { console.error(\"e_machine=\" + m); process.exit(1); }
+              " "$f" && ok "$m 是 ARM ELF" || report "$m 不是 ARM 二进制"
+            done
+
+            node -e "require(\"bcrypt\"); require(\"serialport\"); require(\"i2c-bus\"); require(\"evdev\"); console.log(\"ok:   原生模块可加载\")" \
+              || report "原生模块无法 require"
+
+            # 视频后端
+            command -v ustreamer >/dev/null && ok "ustreamer 存在" || report "缺少 ustreamer"
+            ustreamer --help >/dev/null 2>&1 \
+              && ok "ustreamer 可执行" || report "ustreamer 无法运行"
+            command -v v4l2-ctl >/dev/null && ok "v4l2-ctl 存在" || report "缺少 v4l2-ctl"
+            command -v jq >/dev/null && ok "jq 存在" || report "缺少 jq"
+
+            # 入口脚本
+            [ -x /usr/local/bin/entrypoint.sh ] \
+              && ok "entrypoint 可执行" || report "entrypoint.sh 不可执行"
+
+            exit $rc
+          '
+
+      - name: Verify entrypoint reports missing hardware
+        run: |
+          set -eu
+          # 没有 /dev/video* 且没有 UDC 时，入口必须给出可读的报错而不是崩溃栈
+          out=$(docker run --rm --platform linux/arm/v7 "$LOCAL_TAG" 2>&1 || true)
+          echo "$out"
+          if echo "$out" | grep -q "既无 USB gadget 也无采集设备"; then
+            echo "ok: 无硬件时给出明确提示"
+          else
+            echo "FAIL: 无硬件时未给出预期提示"
+            exit 1
+          fi
+
+      - name: Tag and push
+        if: steps.gate.outputs.push == 'true'
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -eu
+          echo "$TAGS" | while read -r t; do
+            [ -n "$t" ] || continue
+            docker tag "$LOCAL_TAG" "$t"
+            docker push "$t"
+          done
+
+      - name: Summary
+        run: |
+          {
+            echo "### BliKVM 2.x armhf"
+            echo ""
+            echo "- 上游 commit: \`$UPSTREAM_REF\`"
+            echo "- 推送: \`${{ steps.gate.outputs.push }}\`"
+            if [ "${{ steps.gate.outputs.push }}" = "true" ]; then
+              echo "- 标签:"
+              echo '```'
+              echo "${{ steps.meta.outputs.tags }}"
+              echo '```'
+            fi
+            echo ""
+            echo "目标板拉取: \`docker pull $IMAGE:2.x-armhf\`"
+          } >> "$GITHUB_STEP_SUMMARY"
