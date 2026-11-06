@@ -130,86 +130,9 @@ jobs:
         run: |
           set -eu
           # 必须覆盖 ENTRYPOINT，否则 entrypoint.sh 会忽略这里的参数直接拉起服务
-          docker run --rm --platform linux/arm/v7 --entrypoint bash "$LOCAL_TAG" -lc '
-            set -u
-            rc=0
-            report() { echo "FAIL: $*"; rc=1; }
-            ok()     { echo "ok:   $*"; }
-
-            # 补丁必须真的落进镜像，否则运行时会退回上游的板型白名单
-            grep -q "GENERIC" /opt/blikvm/src/common/enums.js \
-              && ok "enums.js 有 GENERIC" || report "enums.js 缺少 GENERIC"
-            grep -q "hasV4L2Capture" /opt/blikvm/src/common/tool.js \
-              && ok "tool.js 已补丁" || report "tool.js 未打补丁"
-            grep -q "generic" /opt/blikvm/src/modules/update/app_default_config.js \
-              && ok "app_default_config 已补丁" || report "app_default_config.js 未打补丁"
-            grep -q "pick_capture_device" /opt/blikvm/lib/kvmd-video.sh \
-              && ok "kvmd-video.sh 已替换" || report "kvmd-video.sh 未替换"
-
-            # 补丁后的 JS 必须能通过语法检查
-            for f in src/common/enums.js src/common/tool.js src/modules/update/app_default_config.js; do
-              node --check "/opt/blikvm/$f" && ok "$f 语法正常" || report "$f 语法错误"
-            done
-
-            # 原生模块必须是 armhf 的 ELF (e_machine=40/EM_ARM) 且能真正 require。
-            # 用 node 读 ELF 头，避免为了 readelf 往 slim 镜像里塞 binutils。
-            #
-            # 注意 serialport v12 是纯 JS 包装，真正的 .node 绑定在
-            # @serialport/bindings-cpp 里；该包可能同时带多个平台的预编译
-            # 占位文件，所以要扫描全部 .node，只要有一个是 ARM 即算通过。
-            check_elf() {  # $1=被检包名  $2=产物所在包目录
-              d="/opt/blikvm/node_modules/$2"
-              [ -d "$d" ] || { report "$2 未安装（$1 依赖）"; return; }
-              node -e '
-                const fs = require("fs"), path = require("path");
-                const root = process.argv[1];
-                const walk = (d) => fs.readdirSync(d, { withFileTypes: true }).flatMap((e) => {
-                  const p = path.join(d, e.name);
-                  return e.isDirectory() ? walk(p) : [p];
-                });
-                const nodes = walk(root).filter((f) => f.endsWith(".node"));
-                if (!nodes.length) { console.error("没有 .node 产物"); process.exit(1); }
-                const arms = nodes.filter((f) => {
-                  const b = fs.readFileSync(f);
-                  return b.length > 20 && b.readUInt16LE(18) === 40;
-                });
-                if (!arms.length) {
-                  console.error("无 ARM ELF，候选: " + nodes.map((f) => path.basename(f)).join(","));
-                  process.exit(1);
-                }
-                console.log(arms.map((f) => path.basename(f)).join(","));
-              ' "$d" >/dev/null && ok "$2 含 ARM ELF（供 $1）" || report "$2 无 ARM 二进制（供 $1）"
-            }
-
-            check_elf bcrypt     bcrypt
-            check_elf serialport "@serialport/bindings-cpp"
-            check_elf i2c-bus    i2c-bus
-            check_elf evdev      evdev
-
-            node -e "require(\"bcrypt\"); require(\"serialport\"); require(\"i2c-bus\"); require(\"evdev\"); console.log(\"ok:   原生模块可加载\")" \
-              || report "原生模块无法 require"
-
-            # require 成功不代表绑定可用；真正调一次串口枚举，确保
-            # @serialport/bindings-cpp 能在 armhf 上实际运行
-            node -e "
-              const { SerialPort } = require(\"serialport\");
-              SerialPort.list().then((p) => console.log(\"ok:   串口枚举可用（\" + p.length + \" 个）\"))
-                .catch((e) => { console.error(e.message); process.exit(1); });
-            " || report "串口绑定无法运行"
-
-            # 视频后端
-            command -v ustreamer >/dev/null && ok "ustreamer 存在" || report "缺少 ustreamer"
-            ustreamer --help >/dev/null 2>&1 \
-              && ok "ustreamer 可执行" || report "ustreamer 无法运行"
-            command -v v4l2-ctl >/dev/null && ok "v4l2-ctl 存在" || report "缺少 v4l2-ctl"
-            command -v jq >/dev/null && ok "jq 存在" || report "缺少 jq"
-
-            # 入口脚本
-            [ -x /usr/local/bin/entrypoint.sh ] \
-              && ok "entrypoint 可执行" || report "entrypoint.sh 不可执行"
-
-            exit $rc
-          '
+          docker run --rm --platform linux/arm/v7 \
+            -v "$PWD/docker-2x/tests:/verify:ro" \
+            --entrypoint bash "$LOCAL_TAG" /verify/verify-image.sh
 
       - name: Verify entrypoint reports missing hardware
         run: |
