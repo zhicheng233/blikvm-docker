@@ -66,5 +66,72 @@ for (const c of resCases) {
   console.log(`${ok ? 'PASS' : 'FAIL'}  分辨率 ${c.desc.padEnd(20)} -> ${got === 1 ? '缩放' : '直出'}`);
 }
 
+// ---------------------------------------------------------------------------
+// 二进制路径决策
+//
+// 上游把 ustreamer/janus/kvmd-main 的路径写成 ./lib/<board>/...，
+// 只有 pi / h616 两套预编译产物。通用板必须回落到系统 PATH 里的命令名，
+// 否则视频脚本收到的是一个不存在的 ./lib/generic/ustreamer.bin 并 exit 1。
+// 这是真机启动时实际踩到的坑，不是假想问题。
+// ---------------------------------------------------------------------------
+function videoBin(hardware) {
+  const isGeneric = hardware === 'generic';
+  return isGeneric ? 'ustreamer' : `./lib/${hardware}/ustreamer.bin`;
+}
+
+function janusBin(hardware) {
+  const isGeneric = hardware === 'generic';
+  return isGeneric ? '' : `./lib/${hardware}/janus`;
+}
+
+console.log('');
+const binCases = [
+  { hw: 'generic', wantVideo: 'ustreamer',              wantJanus: '',  desc: '通用板用系统 ustreamer' },
+  { hw: 'pi',      wantVideo: './lib/pi/ustreamer.bin', wantJanus: './lib/pi/janus', desc: 'Pi 用预编译产物' },
+  { hw: 'h616',    wantVideo: './lib/h616/ustreamer.bin', wantJanus: './lib/h616/janus', desc: 'H616 用预编译产物' },
+];
+for (const c of binCases) {
+  const v = videoBin(c.hw);
+  const j = janusBin(c.hw);
+  const ok = v === c.wantVideo && j === c.wantJanus;
+  if (!ok) failed++;
+  console.log(`${ok ? 'PASS' : 'FAIL'}  二进制路径 ${c.desc.padEnd(22)} -> ${v || '(空)'}`);
+}
+
+// 通用板绝不能指向 lib/generic 下不存在的文件
+if (videoBin('generic').includes('lib/generic')) {
+  failed++;
+  console.log('FAIL  通用板路径仍指向 lib/generic');
+}
+
+// ---------------------------------------------------------------------------
+// device-tree 读取容错
+//
+// getHardwareTypeForConfig() 在模块加载期执行 execSync，
+// 没有 /proc/device-tree 时必须降级为通用板而不是抛异常。
+// ---------------------------------------------------------------------------
+function classifyForConfig(modelOutput) {
+  const pi4bSys = 'Raspberry Pi 4 Model B';
+  const mangoPiSys = 'MangoPi Mcore';
+  const piCM4Sys = 'Raspberry Pi Compute Module 4';
+  if (modelOutput.includes(pi4bSys) || modelOutput.includes(piCM4Sys)) return 'pi';
+  if (modelOutput.includes(mangoPiSys)) return 'h616';
+  return 'generic';
+}
+
+console.log('');
+const cfgCases = [
+  { model: 'Xunlei OneCloud', want: 'generic', desc: 'OneCloud' },
+  { model: '', want: 'generic', desc: '无 device-tree（容器）' },
+  { model: 'Raspberry Pi 4 Model B Rev 1.4', want: 'pi', desc: 'Pi4' },
+  { model: 'MangoPi Mcore', want: 'h616', desc: 'MangoPi' },
+];
+for (const c of cfgCases) {
+  const got = classifyForConfig(c.model);
+  const ok = got === c.want;
+  if (!ok) failed++;
+  console.log(`${ok ? 'PASS' : 'FAIL'}  默认配置 ${c.desc.padEnd(24)} -> ${got}`);
+}
+
 console.log(`\n${failed === 0 ? '全部通过' : failed + ' 项失败'}`);
 process.exit(failed === 0 ? 0 : 1);

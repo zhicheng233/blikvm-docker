@@ -148,6 +148,94 @@ PY
 fi
 
 # ---------------------------------------------------------------------------
+# 3a) app_default_config.js：device-tree 读取容错
+# ---------------------------------------------------------------------------
+# 必须单独成一个幂等块。这一行在模块加载期就执行，没有 /proc/device-tree
+# （容器、虚拟机）会直接让进程崩溃；而崩溃发生在 import 阶段，
+# 连日志和兜底逻辑都来不及跑。之前把它塞进上一块里，导致已经打过
+# 'generic' 补丁的源码树会跳过这项修复 —— 校验步骤抓到了这个漏洞。
+if grep -q "modelOutput = ''" src/modules/update/app_default_config.js; then
+    log "app_default_config.js device-tree 容错已打过补丁，跳过"
+else
+    log "打补丁: app_default_config.js device-tree 容错"
+    python3 - <<'PY'
+import sys
+p = 'src/modules/update/app_default_config.js'
+s = open(p, encoding='utf-8').read()
+
+old_read = "    const modelOutput = execSync('cat /proc/device-tree/model').toString();"
+new_read = """    let modelOutput = '';
+    try {
+      modelOutput = execSync('cat /proc/device-tree/model').toString();
+    } catch (e) {
+      // 容器/虚拟环境通常没有 device-tree，按通用板处理
+      modelOutput = '';
+    }"""
+if old_read not in s:
+    sys.exit('app_default_config.js: 找不到 model 读取语句，上游结构可能已变化')
+s = s.replace(old_read, new_read, 1)
+
+open(p, 'w', encoding='utf-8').write(s)
+print('app_default_config.js device-tree tolerance patched')
+PY
+fi
+
+# ---------------------------------------------------------------------------
+# 3d) 二进制路径：lib/<board>/ 下没有 generic 目录
+# ---------------------------------------------------------------------------
+# 上游把 ustreamer/janus/kvmd-main 的路径写成 `./lib/${hardware}/...`，
+# 只有 pi / h616 两套预编译产物。通用板用的是系统 ustreamer，
+# 必须把这些路径改成宿主 PATH 里的命令名，否则视频脚本拿到的是
+# 一个不存在的 ./lib/generic/ustreamer.bin。
+if grep -q 'genericBin' src/modules/update/app_default_config.js; then
+    log "app_default_config.js 二进制路径已打过补丁，跳过"
+else
+    log "打补丁: app_default_config.js 通用板二进制路径"
+    python3 - <<'PY'
+import re, sys
+p = 'src/modules/update/app_default_config.js'
+s = open(p, encoding='utf-8').read()
+
+# 在 hardware 常量之后声明通用板要用的命令名
+anchor = "const hardware = getHardwareTypeForConfig();"
+if anchor not in s:
+    sys.exit('app_default_config.js: 找不到 hardware 常量，上游结构可能已变化')
+inject = anchor + """
+
+// 通用板（容器/非官方硬件）没有 lib/<board>/ 预编译产物，
+// 直接用系统 PATH 里的同名命令。ustreamer 来自 Debian 的 armhf 包，
+// janus / kvmd-main 在本方案中不启用（见 README 的视频与 USB 章节）。
+const isGeneric = hardware === 'generic';
+const genericBin = { ustreamer: 'ustreamer', janus: '', kvmd: '' };
+"""
+s = s.replace(anchor, inject, 1)
+
+# 把 `${hardware}` 形式的路径换成对通用板安全的形式
+repls = [
+    ("\"bin\": `./lib/${hardware}/ustreamer.bin`",
+     "\"bin\": isGeneric ? genericBin.ustreamer : `./lib/${hardware}/ustreamer.bin`"),
+    ("\"recordBin\": `./lib/${hardware}/ustreamer-dump`",
+     "\"recordBin\": isGeneric ? '' : `./lib/${hardware}/ustreamer-dump`"),
+    ("\"bin\": `./lib/${hardware}/janus`",
+     "\"bin\": isGeneric ? genericBin.janus : `./lib/${hardware}/janus`"),
+    ("\"configsFolder\": `./lib/${hardware}/janus_configs`",
+     "\"configsFolder\": isGeneric ? '' : `./lib/${hardware}/janus_configs`"),
+    ("\"pluginsFolder\": `./lib/${hardware}/janus_plugins`",
+     "\"pluginsFolder\": isGeneric ? '' : `./lib/${hardware}/janus_plugins`"),
+    ("\"bin\": `./lib/${hardware}/kvmd-main`",
+     "\"bin\": isGeneric ? genericBin.kvmd : `./lib/${hardware}/kvmd-main`"),
+]
+for old, new in repls:
+    if old not in s:
+        sys.exit(f'app_default_config.js: 找不到路径 {old}，上游结构可能已变化')
+    s = s.replace(old, new, 1)
+
+open(p, 'w', encoding='utf-8').write(s)
+print('app_default_config.js binary paths patched')
+PY
+fi
+
+# ---------------------------------------------------------------------------
 # 4) 用适配版视频脚本替换上游版本
 # ---------------------------------------------------------------------------
 if [ -f "$PATCH_DIR/kvmd-video.sh" ]; then
@@ -165,7 +253,15 @@ log "校验补丁"
 grep -q "GENERIC" src/common/enums.js || die "enums.js 补丁未生效"
 grep -q "hasV4L2Capture" src/common/tool.js || die "tool.js 补丁未生效"
 grep -q "'generic'" src/modules/update/app_default_config.js || die "app_default_config.js 补丁未生效"
+grep -q "isGeneric" src/modules/update/app_default_config.js || die "二进制路径补丁未生效"
 grep -q "pick_capture_device" lib/kvmd-video.sh || die "kvmd-video.sh 未被替换"
+
+# device-tree 读取必须容错：这一行在模块加载期执行，
+# 没有 device-tree 的环境会直接崩溃
+grep -q "modelOutput = ''" src/modules/update/app_default_config.js \
+    || die "app_default_config.js 的 device-tree 容错未生效"
+grep -q "let modelOutput = '';" src/common/tool.js \
+    || die "tool.js 的 device-tree 容错未生效"
 
 # JS 语法检查（node 已在镜像中）
 node --check src/common/tool.js || die "tool.js 语法错误"

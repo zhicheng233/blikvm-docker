@@ -39,6 +39,17 @@ grep -q "pick_capture_device" "$APP_DIR/lib/kvmd-video.sh" \
 grep -q '"native"' "$APP_DIR/src/modules/update/app_default_config.js" \
     && ok "默认分辨率为 native" || report "默认分辨率未改为 native"
 
+# device-tree 容错：这一行在模块加载期执行，缺容错会让容器直接崩溃
+grep -q "modelOutput = ''" "$APP_DIR/src/modules/update/app_default_config.js" \
+    && ok "app_default_config device-tree 容错" || report "app_default_config 缺 device-tree 容错"
+
+# 通用板不能指向 lib/generic 下不存在的二进制
+if grep -q 'isGeneric' "$APP_DIR/src/modules/update/app_default_config.js"; then
+    ok "通用板二进制路径已改写"
+else
+    report "通用板仍会指向 lib/generic/ustreamer.bin"
+fi
+
 # ---------------------------------------------------------------------------
 # 2. 补丁后的 JS 必须仍然可解析
 # ---------------------------------------------------------------------------
