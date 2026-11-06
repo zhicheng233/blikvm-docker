@@ -96,15 +96,16 @@ fi
 # ---------------------------------------------------------------------------
 cd "$APP_DIR"
 missing=""
-for m in serialport i2c-bus bcrypt evdev; do
+for m in serialport i2c-bus bcrypt evdev unix-dgram koffi; do
     if [ ! -d "node_modules/$m" ] && [ ! -d "/usr/lib/nodejs/$m" ]; then
         missing="$missing $m"
     fi
 done
 if [ -n "$missing" ]; then
     warn "缺少原生 Node 模块:$missing"
-    warn "  → 串口 / EEPROM 读板型 / 账号密码哈希 相关功能可能不可用"
+    warn "  → 串口 / EEPROM 读板型 / 账号密码哈希 / ATX 电源控制 / 文本输入 可能不可用"
     warn "  → 账号功能依赖 bcrypt，缺失将导致无法登录，请务必补齐"
+    warn "  → 模块缺失通常意味着镜像构建失败，而不是运行时问题"
 fi
 
 # ---------------------------------------------------------------------------

@@ -62,10 +62,10 @@ docker pull ghcr.io/zhicheng233/blikvm-2x-armhf:2.x-armhf
 zstd -d blikvm-2x-armhf.tar.zst | docker load
 ```
 
-CI 每次构建都会先跑冒烟测试再推送，验证内容包括：三个补丁确实落进镜像、
-补丁后的 JS 仍能通过 `node --check`、四个原生模块是 armhf ELF 且能实际调用
-（bcrypt 真算一次哈希、serialport 真枚举串口）、ustreamer 可执行、入口脚本可执行。
-任一失败则不推送镜像。
+CI 每次构建都会先跑冒烟测试再推送，验证内容包括：四个补丁确实落进镜像、
+补丁后的 JS 仍能通过 `node --check`、六个原生模块是 armhf ELF 且能实际调用
+（bcrypt 真算一次哈希、serialport 真枚举串口、koffi 真打开 `libxkbcommon` 并调用）、
+ustreamer 可执行、入口脚本可执行。任一失败则不推送镜像。
 
 自行构建（需要 armhf 环境或 QEMU binfmt）：
 
@@ -86,7 +86,7 @@ docker compose up -d
 
 ## 打了哪些补丁
 
-上游代码把硬件型号写死了，非官方板直接失效。本方案改三处：
+上游代码把硬件型号写死了，非官方板直接失效；另有一个 FFI 依赖在新版 Node 上根本编译不出来。本方案改四处：
 
 ### 1. `lib/kvmd-video.sh` —— 整份替换
 
@@ -116,13 +116,37 @@ docker compose up -d
 重复执行会跳过已打的补丁；上游结构变化导致补丁打不上时会**立即报错退出**，
 不会悄悄产出行为错误的镜像。
 
+### 4. `src/modules/hid/printer.js` —— FFI 后端换成 koffi
+
+上游用 `ffi-napi` + `ref-napi` 在**模块加载期**绑定 `libxkbcommon`，用于把字符
+转成 keysym（键盘「输入文本」功能）。这两个包最后维护于 Node 16 时代，
+在 Node 20 上编译失败：
+
+```
+error: invalid conversion from 'napi_status (*)(node_api_basic_env, uv_loop_s**)'
+       to 'get_uv_event_loop_fn' ...
+```
+
+（这是 CI 里实际跑出来的结论，不是推测：用一次性探针镜像逐个 `node-gyp rebuild`
+验证过，`unix-dgram` / `ref-napi` 能编，`ffi-napi` / `cpu-features` 不能。）
+
+又不能直接删掉 import —— 删了 `printer.js` 就少了 `textToWebKeys`，键盘输入文本
+会失效。因此改用 [koffi](https://koffi.dev/)：维护活跃，自带 armhf 预编译产物
+（`@koromix/koffi-linux-arm` 内的 `linux_armhf`），运行镜像不需要编译器。
+调用语义等价，已在 armhf 容器里实测过返回值（`A`→0x41、`€`→0x20AC、
+`中`→0x1004E2D）。
+
+`cpu-features` 是 `ssh2` 的可选加速器，编译失败会被 `ssh2` 静默忽略，
+因此不列入 `npm rebuild`（列入反而会让构建非零退出）。
+
 ## 验证状态
 
 | 项 | 状态 |
 |---|---|
-| 补丁逻辑（板型判断 / 分辨率策略） | ✅ 10/10 通过（`node --test tests/`） |
+| 补丁逻辑（板型判断 / 分辨率策略 / koffi 替换） | ✅ 27/27 通过（`node --test tests/`） |
 | 补丁脚本幂等性 | ✅ 重复执行正确跳过 |
 | 打补丁后 JS 语法 | ✅ `node --check` 通过 |
+| 原生模块编译可行性（armhf + Node 20） | ✅ 探针实测：`unix-dgram`/`ref-napi` 可编，`ffi-napi`/`cpu-features` 不可编 |
 | 镜像构建（GitHub Actions, linux/arm/v7） | ✅ 构建通过 |
 | 镜像内冒烟测试 | ✅ 补丁 / ELF 架构 / 原生模块调用 / 视频后端 / 入口 |
 | 容器启动（有硬件） | ⏳ 待验证 |
@@ -183,8 +207,8 @@ master 快照）。上游若更新，需要同步改这两处并重新验证补�
 ## 与上游的关系
 
 - 本目录是**适配层**，不含上游源码；构建时从 GitHub 拉取并打补丁
-- 补丁只改「板型判断」和「分辨率策略」，不改变业务逻辑
-- 上游更新时，若 `kvmd-video.sh` 结构变化，补丁需要同步调整
+- 补丁只改「板型判断」「分辨率策略」「FFI 后端」，不改变业务逻辑
+- 上游更新时，若 `kvmd-video.sh` 或 `printer.js` 结构变化，补丁需要同步调整
 
 ## 许可证
 

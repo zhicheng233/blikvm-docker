@@ -133,5 +133,83 @@ for (const c of cfgCases) {
   console.log(`${ok ? 'PASS' : 'FAIL'}  默认配置 ${c.desc.padEnd(24)} -> ${got}`);
 }
 
+// ---------------------------------------------------------------------------
+// printer.js 的 FFI 后端替换
+//
+// 上游在模块加载期就用 ffi-napi 绑定 libxkbcommon，而 ffi-napi 在 Node 20
+// 上编译失败（NAPI 的 node_api_basic_env 变更），CI 探测已确认。补丁把它
+// 换成 koffi。这里复刻同样的三次替换，并确认幂等与无残留。
+// ---------------------------------------------------------------------------
+const PRINTER_FIXTURE = `import ffi from 'ffi-napi';
+import ref from 'ref-napi';
+import { SymmapModifiers, getSysmap } from './keysym.js';
+
+// 定义 XKB 字符串类型
+const uint32 = ref.types.uint32;
+
+// 加载 xkbcommon 库
+const libxkbcommon = ffi.Library('libxkbcommon', {
+    'xkb_utf32_to_keysym': ['uint32', ['uint32']], // xkb_utf32_to_keysym 函数
+});
+
+const chToKeysym = (ch) => {
+    return libxkbcommon.xkb_utf32_to_keysym(ch.charCodeAt(0));
+};
+`;
+
+function patchPrinter(s) {
+  const oldImports = "import ffi from 'ffi-napi';\nimport ref from 'ref-napi';\n";
+  const newImports = "import koffi from 'koffi';\n";
+  if (s.includes(oldImports)) {
+    s = s.replace(oldImports, newImports);
+  } else if (!s.includes(newImports)) {
+    throw new Error('import 锚点缺失');
+  }
+
+  const oldLib = `// 定义 XKB 字符串类型
+const uint32 = ref.types.uint32;
+
+// 加载 xkbcommon 库
+const libxkbcommon = ffi.Library('libxkbcommon', {
+    'xkb_utf32_to_keysym': ['uint32', ['uint32']], // xkb_utf32_to_keysym 函数
+});
+`;
+  const newLib = `const libxkbcommon = koffi.load('libxkbcommon.so.0');
+const xkb_utf32_to_keysym = libxkbcommon.func('uint32 xkb_utf32_to_keysym(uint32)');
+`;
+  if (s.includes(oldLib)) {
+    s = s.replace(oldLib, newLib);
+  } else if (!s.includes("koffi.load('libxkbcommon")) {
+    throw new Error('绑定块锚点缺失');
+  }
+
+  const oldCall = 'libxkbcommon.xkb_utf32_to_keysym(ch.charCodeAt(0))';
+  if (s.includes(oldCall)) {
+    s = s.replace(oldCall, 'xkb_utf32_to_keysym(ch.charCodeAt(0))');
+  }
+  return s;
+}
+
+console.log('');
+const patched = patchPrinter(PRINTER_FIXTURE);
+const patchedTwice = patchPrinter(patched);
+
+const printerChecks = [
+  { desc: '移除 ffi-napi import',   ok: !patched.includes("from 'ffi-napi'") },
+  { desc: '移除 ref-napi import',   ok: !patched.includes("from 'ref-napi'") },
+  { desc: '移除 ref.types.uint32',  ok: !patched.includes('ref.types') },
+  { desc: '移除 ffi.Library 调用',  ok: !patched.includes('ffi.Library') },
+  { desc: '引入 koffi',             ok: patched.includes("from 'koffi'") },
+  { desc: 'koffi 绑定 libxkbcommon', ok: patched.includes("koffi.load('libxkbcommon.so.0')") },
+  { desc: '声明 xkb_utf32_to_keysym', ok: patched.includes('const xkb_utf32_to_keysym =') },
+  { desc: '调用点已改写',           ok: patched.includes('xkb_utf32_to_keysym(ch.charCodeAt(0))') && !patched.includes('libxkbcommon.xkb_utf32_to_keysym') },
+  { desc: '保留 keysym.js import',  ok: patched.includes("from './keysym.js'") },
+  { desc: '幂等',                   ok: patched === patchedTwice },
+];
+for (const c of printerChecks) {
+  if (!c.ok) failed++;
+  console.log(`${c.ok ? 'PASS' : 'FAIL'}  printer.js ${c.desc}`);
+}
+
 console.log(`\n${failed === 0 ? '全部通过' : failed + ' 项失败'}`);
 process.exit(failed === 0 ? 0 : 1);

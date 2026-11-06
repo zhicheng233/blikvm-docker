@@ -24,6 +24,7 @@ die() { echo "[patch] ERROR: $*" >&2; exit 1; }
 [ -f src/common/tool.js ] || die "找不到 src/common/tool.js，源码目录不对: $SRC"
 [ -f src/common/enums.js ] || die "找不到 src/common/enums.js"
 [ -f src/modules/update/app_default_config.js ] || die "找不到 app_default_config.js"
+[ -f src/modules/hid/printer.js ] || die "找不到 src/modules/hid/printer.js"
 
 # ---------------------------------------------------------------------------
 # 1) enums.js：新增 HardwareType.GENERIC
@@ -236,6 +237,66 @@ PY
 fi
 
 # ---------------------------------------------------------------------------
+# 3e) printer.js：用 koffi 取代 ffi-napi / ref-napi
+# ---------------------------------------------------------------------------
+# printer.js 在「模块加载期」就通过 FFI 绑定 libxkbcommon：
+#   import ffi from 'ffi-napi';
+#   const libxkbcommon = ffi.Library('libxkbcommon', { xkb_utf32_to_keysym: ... });
+# 而 ffi-napi 在 Node 20 上无法编译：它的 node-addon-api 版本早于 NAPI 的
+# node_api_basic_env / const napi_env 变更（CI 探测已确认编译报错）。
+# 上游也已停止维护，没有可用的新版本。
+#
+# 不能简单删掉 import：键盘的「输入文本」功能依赖 xkb_utf32_to_keysym。
+# 改用 koffi：维护活跃、自带 armhf 预编译产物（@koromix/koffi-linux-arm，
+# 内含 linux_armhf 二进制），调用语义等价，已在 armhf 容器内实测过返回值。
+if grep -q "koffi.load('libxkbcommon" src/modules/hid/printer.js; then
+    log "printer.js 已打过补丁，跳过"
+else
+    log "打补丁: printer.js 改用 koffi 绑定 libxkbcommon"
+    python3 - <<'PY'
+import sys
+p = 'src/modules/hid/printer.js'
+s = open(p, encoding='utf-8').read()
+
+# 3e-1) 替换 import
+old_imports = "import ffi from 'ffi-napi';\nimport ref from 'ref-napi';\n"
+new_imports = "import koffi from 'koffi';\n"
+if old_imports in s:
+    s = s.replace(old_imports, new_imports, 1)
+elif new_imports not in s:
+    sys.exit('printer.js: 找不到 ffi-napi / ref-napi 的 import，上游结构可能已变化')
+
+# 3e-2) 替换 ffi.Library 绑定块（含 ref.types.uint32 声明）
+old_lib = """// 定义 XKB 字符串类型
+const uint32 = ref.types.uint32;
+
+// 加载 xkbcommon 库
+const libxkbcommon = ffi.Library('libxkbcommon', {
+    'xkb_utf32_to_keysym': ['uint32', ['uint32']], // xkb_utf32_to_keysym 函数
+});
+"""
+new_lib = """// libxkbcommon 通过 koffi 绑定。
+// 不用 ffi-napi：它在 Node 20 上编译失败（NAPI 签名变更），且已停止维护。
+// koffi 自带 armhf 预编译产物，运行镜像不需要编译器。
+const libxkbcommon = koffi.load('libxkbcommon.so.0');
+const xkb_utf32_to_keysym = libxkbcommon.func('uint32 xkb_utf32_to_keysym(uint32)');
+"""
+if old_lib in s:
+    s = s.replace(old_lib, new_lib, 1)
+elif "koffi.load('libxkbcommon" not in s:
+    sys.exit('printer.js: 找不到 ffi.Library 绑定块，上游结构可能已变化')
+
+# 3e-3) 调用点
+old_call = 'libxkbcommon.xkb_utf32_to_keysym(ch.charCodeAt(0))'
+if old_call in s:
+    s = s.replace(old_call, 'xkb_utf32_to_keysym(ch.charCodeAt(0))', 1)
+
+open(p, 'w', encoding='utf-8').write(s)
+print('printer.js patched')
+PY
+fi
+
+# ---------------------------------------------------------------------------
 # 4) 用适配版视频脚本替换上游版本
 # ---------------------------------------------------------------------------
 if [ -f "$PATCH_DIR/kvmd-video.sh" ]; then
@@ -256,6 +317,14 @@ grep -q "'generic'" src/modules/update/app_default_config.js || die "app_default
 grep -q "isGeneric" src/modules/update/app_default_config.js || die "二进制路径补丁未生效"
 grep -q "pick_capture_device" lib/kvmd-video.sh || die "kvmd-video.sh 未被替换"
 
+# printer.js 必须已经脱离 ffi-napi：该模块在 Node 20 上根本编译不出来，
+# 只要还有一处 import 残留，容器启动就会在加载期崩溃
+grep -q "koffi.load('libxkbcommon" src/modules/hid/printer.js \
+    || die "printer.js 的 koffi 补丁未生效"
+if grep -q "ffi-napi" src/modules/hid/printer.js; then
+    die "printer.js 仍引用 ffi-napi"
+fi
+
 # device-tree 读取必须容错：这一行在模块加载期执行，
 # 没有 device-tree 的环境会直接崩溃
 grep -q "modelOutput = ''" src/modules/update/app_default_config.js \
@@ -267,6 +336,7 @@ grep -q "let modelOutput = '';" src/common/tool.js \
 node --check src/common/tool.js || die "tool.js 语法错误"
 node --check src/common/enums.js || die "enums.js 语法错误"
 node --check src/modules/update/app_default_config.js || die "app_default_config.js 语法错误"
+node --check src/modules/hid/printer.js || die "printer.js 语法错误"
 bash -n lib/kvmd-video.sh || die "kvmd-video.sh 语法错误"
 
 log "全部补丁应用成功"

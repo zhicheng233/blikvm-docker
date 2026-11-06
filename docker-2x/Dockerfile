@@ -54,18 +54,27 @@ RUN /opt/patches/apply-patches.sh /src/blikvm
 
 # 安装 npm 依赖。
 #
-# 原生模块在 armhf 上没有预编译产物，必须现场编译：
+# 原生模块在 armhf 上没有可用的预编译产物，必须现场编译：
 #   serialport  - 串口功能（核心）
 #   i2c-bus     - EEPROM 读板型（非官方板用不到，但 import 链会加载）
 #   bcrypt      - 账号密码哈希（核心，缺失会导致无法登录）
 #   evdev       - HID passthrough；src/index.js 无条件 import，缺失会导致启动崩溃
+#   unix-dgram  - ATX 电源控制；src/server/api/atx.route.js 直接 import
 #
-# ffi-napi / ref-napi 在本项目源码中未被 import，且在新版 Node 上
-# 已知编译失败（它们最后维护于 Node 16 时代）。跳过它们以避免构建中断。
+# cpu-features 是 ssh2 的可选加速器，编译失败不影晌功能，故不列入
+# （列入反而会让 npm rebuild 非零退出而中断构建）。
+#
+# ffi-napi 在 Node 20 上无法编译（NAPI 签名变更），且已停止维护；
+# printer.js 已改用 koffi（见 patches/apply-patches.sh 的 3e 块）。
+# koffi 自带 armhf 预编译产物，安装即可用，无需编译。
 WORKDIR /src/blikvm
+# 注意不要在末尾加 `|| true`：`a && b || true` 会把 npm install / npm rebuild
+# 的失败一起吞掉，构建继续跑下去只会产出一个缺绑定的坏镜像。失败就让它失败。
 RUN npm install --omit=dev --no-audit --no-fund --ignore-scripts \
-    && npm rebuild bcrypt serialport i2c-bus evdev --build-from-source \
-    && npm cache clean --force 2>/dev/null || true
+    && npm install --omit=dev --no-audit --no-fund --ignore-scripts \
+         --save-exact koffi@3.3.7 \
+    && npm rebuild bcrypt serialport i2c-bus evdev unix-dgram --build-from-source
+RUN npm cache clean --force 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 # 运行阶段
@@ -85,6 +94,8 @@ ARG DEBIAN_FRONTEND=noninteractive
 #                      通过它枚举串口，缺失会导致串口设备列表为空（ENOENT）
 #   ffmpeg           - 录制与格式转换（上游 fluent-ffmpeg 调用）
 #   tesseract-ocr    - OCR 功能
+#   libxkbcommon0    - printer.js 通过 koffi 绑定它做 xkb_utf32_to_keysym；
+#                      该绑定在模块加载期执行，缺失会让启动直接失败
 #   bash iproute2 util-linux mount - 上游脚本依赖的常用工具
 RUN apt-get update && apt-get install -y --no-install-recommends \
         nodejs \
@@ -99,6 +110,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         udev \
         ffmpeg \
         tesseract-ocr \
+        libxkbcommon0 \
         bash \
         iproute2 \
         util-linux \

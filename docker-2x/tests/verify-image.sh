@@ -50,12 +50,22 @@ else
     report "通用板仍会指向 lib/generic/ustreamer.bin"
 fi
 
+# printer.js 必须已脱离 ffi-napi：它在 Node 20 上编译不出来，
+# 残留任何 import 都会让进程在加载期崩溃
+grep -q "koffi.load('libxkbcommon" "$APP_DIR/src/modules/hid/printer.js" \
+    && ok "printer.js 使用 koffi" || report "printer.js 未改用 koffi"
+if grep -q "ffi-napi" "$APP_DIR/src/modules/hid/printer.js"; then
+    report "printer.js 仍引用 ffi-napi"
+else
+    ok "printer.js 无 ffi-napi 残留"
+fi
+
 # ---------------------------------------------------------------------------
 # 2. 补丁后的 JS 必须仍然可解析
 # ---------------------------------------------------------------------------
 echo "--- 语法 ---"
 
-for f in src/common/enums.js src/common/tool.js src/modules/update/app_default_config.js; do
+for f in src/common/enums.js src/common/tool.js src/modules/update/app_default_config.js src/modules/hid/printer.js; do
     if node --check "$APP_DIR/$f" 2>/dev/null; then
         ok "$f"
     else
@@ -128,6 +138,16 @@ check_elf bcrypt     bcrypt
 check_elf serialport "@serialport/bindings-cpp"
 check_elf i2c-bus    i2c-bus
 check_elf evdev      evdev
+# atx.route.js 在加载期 import unix-dgram，缺绑定会让启动崩溃
+check_elf unix-dgram unix-dgram
+# koffi 自带 armhf 预编译产物，不需要编译，但必须是 ARM 机器码。
+# 注意：主包 koffi/ 里只有一个平台选择器，真正的二进制在平台子包
+# @koromix/koffi-linux-arm/linux_armhf/ 下，所以要指到子包目录。
+if [ -d "$APP_DIR/node_modules/@koromix/koffi-linux-arm" ]; then
+    check_elf koffi "@koromix/koffi-linux-arm"
+else
+    check_elf koffi koffi
+fi
 
 # ---------------------------------------------------------------------------
 # 4. 原生模块必须能实际运行，不只是 require 成功
@@ -172,6 +192,31 @@ try {
   checks.push('evdev 已加载');
 } catch (e) {
   checks.push(`evdev 失败: ${e.message}`);
+  process.exitCode = 1;
+}
+
+// unix-dgram 由 src/server/api/atx.route.js import，用于 ATX 电源控制
+try {
+  require('unix-dgram');
+  checks.push('unix-dgram 已加载');
+} catch (e) {
+  checks.push(`unix-dgram 失败: ${e.message}`);
+  process.exitCode = 1;
+}
+
+// koffi 是 printer.js 的 FFI 后端：必须能真的打开 libxkbcommon 并调用函数。
+// 只 require 成功不够 —— dlopen 是在 load() 时才发生的。
+try {
+  const koffi = require('koffi');
+  const lib = koffi.load('libxkbcommon.so.0');
+  const toKeysym = lib.func('uint32 xkb_utf32_to_keysym(uint32)');
+  const a = toKeysym(0x41);
+  const cjk = toKeysym(0x4e2d);
+  if (a !== 0x41) throw new Error(`A 的 keysym 期望 0x41，实际 0x${a.toString(16)}`);
+  if (cjk !== 0x1004e2d) throw new Error(`U+4E2D 的 keysym 期望 0x1004E2D，实际 0x${cjk.toString(16)}`);
+  checks.push(`koffi + libxkbcommon 正常 (koffi ${koffi.version})`);
+} catch (e) {
+  checks.push(`koffi/libxkbcommon 失败: ${e.message}`);
   process.exitCode = 1;
 }
 
