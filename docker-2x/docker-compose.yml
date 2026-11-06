@@ -1,0 +1,59 @@
+# BliKVM 2.x 容器编排
+#
+# 运行要求：
+#   - 特权模式（USB gadget 配置、loop 设备、挂载需要）
+#   - 宿主 /dev 直通（采集卡与 UDC）
+#   - 不挂载宿主 /、docker.sock、systemd、D-Bus
+#
+# 启动：docker compose up -d --build
+# 查看：docker compose logs -f
+
+services:
+  blikvm:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # 固定上游 commit 以保证可复现；留空则跟随 master
+        BLIKVM_REF: ""
+    image: blikvm:2.x-armhf
+    container_name: blikvm
+    restart: unless-stopped
+
+    # USB gadget 配置、loop 设备、文件系统挂载都需要特权
+    privileged: true
+
+    # 采集卡、UDC、loop 设备全部来自宿主 /dev
+    volumes:
+      - /dev:/dev
+      - blikvm-config:/data/config
+      - blikvm-msd:/mnt/msd
+      - blikvm-record:/mnt/tmp/record
+
+    # 上游固定端口：80/443 Web，10004 ustreamer，10002 MSD 上传
+    ports:
+      - "80:80"
+      - "443:443"
+      - "10004:10004"
+      - "10002:10002"
+
+    environment:
+      # 视频：默认 MJPEG 软件编码，按源分辨率直出
+      KVM_VIDEO_ENCODER: "CPU"
+      KVM_VIDEO_FORMAT: "MJPEG"
+      # 留空 = 不缩放，按采集源分辨率直出（运维场景推荐）
+      KVM_VIDEO_RESOLUTION: ""
+      # 显式指定采集设备；留空则自动探测
+      KVM_VIDEO_DEVICE: ""
+      TZ: "Asia/Shanghai"
+
+    # 容器内需要 /sys 的部分可写（gadget 配置）
+    # 注意：不映射宿主 PID 命名空间，不挂 docker.sock
+    tmpfs:
+      - /run
+      - /tmp
+
+volumes:
+  blikvm-config:
+  blikvm-msd:
+  blikvm-record:

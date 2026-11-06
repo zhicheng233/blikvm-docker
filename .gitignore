@@ -19,3 +19,7 @@ static/site-version.json
 # Temporary source checkout used only during migration
 .website-source/
 .migration-checkout/
+
+# docker-2x: 构建产物与本地测试临时文件
+docker-2x/.build/
+docker-2x/upstream/
