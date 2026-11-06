@@ -13,7 +13,7 @@ ARG BLIKVM_REF=cecede74ebe75239576c5eebf2eed7c4003a26fa
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git ca-certificates python3 curl \
-        nodejs npm build-essential pkg-config \
+        nodejs npm node-gyp build-essential pkg-config \
         libudev-dev libi2c-dev \
     && rm -rf /var/lib/apt/lists/*
 
@@ -28,7 +28,7 @@ WORKDIR /src/blikvm
 # 用 ignore-scripts 装完依赖，再逐个手动编译，这样能单独观察每个模块的结果
 RUN npm install --omit=dev --no-audit --no-fund --ignore-scripts
 
-COPY tests/probe.sh /probe.sh
+COPY probe.sh /probe.sh
 RUN chmod +x /probe.sh
 
 ENTRYPOINT ["/probe.sh"]

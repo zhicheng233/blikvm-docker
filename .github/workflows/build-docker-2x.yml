@@ -82,8 +82,10 @@ jobs:
         if: inputs.probe-native
         uses: docker/build-push-action@v6
         with:
-          context: docker-2x
-          file: docker-2x/tests/Dockerfile.probe
+          # 探测镜像只需要 probe.sh，把上下文收窄到 tests/ 可以绕开
+          # docker-2x/.dockerignore 对 tests/ 的排除（那份排除是给正式镜像用的）。
+          context: docker-2x/tests
+          file: Dockerfile.probe
           platforms: linux/arm/v7
           load: true
           tags: blikvm-probe:test
