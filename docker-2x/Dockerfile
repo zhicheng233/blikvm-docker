@@ -81,6 +81,8 @@ ARG DEBIAN_FRONTEND=noninteractive
 #   jq               - kvmd-msd.sh 依赖
 #   libjpeg62-turbo  - ustreamer 运行时依赖
 #   libudev1         - serialport 原生模块运行时依赖
+#   udev             - 提供 udevadm；serialport 的 SerialPort.list() 在 Linux 上
+#                      通过它枚举串口，缺失会导致串口设备列表为空（ENOENT）
 #   ffmpeg           - 录制与格式转换（上游 fluent-ffmpeg 调用）
 #   tesseract-ocr    - OCR 功能
 #   bash iproute2 util-linux mount - 上游脚本依赖的常用工具
@@ -94,6 +96,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libevent-pthreads-2.1-7t64 \
         libbsd0 \
         libudev1 \
+        udev \
         ffmpeg \
         tesseract-ocr \
         bash \
