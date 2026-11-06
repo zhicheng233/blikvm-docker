@@ -155,18 +155,30 @@ jobs:
             # 用 node 读 ELF 头，避免为了 readelf 往 slim 镜像里塞 binutils。
             #
             # 注意 serialport v12 是纯 JS 包装，真正的 .node 绑定在
-            # @serialport/bindings-cpp 里，所以按「包的依赖树」而不是包目录找产物。
+            # @serialport/bindings-cpp 里；该包可能同时带多个平台的预编译
+            # 占位文件，所以要扫描全部 .node，只要有一个是 ARM 即算通过。
             check_elf() {  # $1=被检包名  $2=产物所在包目录
               d="/opt/blikvm/node_modules/$2"
               [ -d "$d" ] || { report "$2 未安装（$1 依赖）"; return; }
-              f=$(find "$d" -name "*.node" -type f | head -1)
-              [ -n "$f" ] || { report "$2 没有 .node 产物（$1 依赖）"; return; }
-              node -e "
-                const fs = require(\"fs\");
-                const b = fs.readFileSync(process.argv[1]);
-                const m = b.readUInt16LE(18);
-                if (m !== 40) { console.error(\"e_machine=\" + m); process.exit(1); }
-              " "$f" && ok "$2 是 ARM ELF（供 $1）" || report "$2 不是 ARM 二进制"
+              node -e '
+                const fs = require("fs"), path = require("path");
+                const root = process.argv[1];
+                const walk = (d) => fs.readdirSync(d, { withFileTypes: true }).flatMap((e) => {
+                  const p = path.join(d, e.name);
+                  return e.isDirectory() ? walk(p) : [p];
+                });
+                const nodes = walk(root).filter((f) => f.endsWith(".node"));
+                if (!nodes.length) { console.error("没有 .node 产物"); process.exit(1); }
+                const arms = nodes.filter((f) => {
+                  const b = fs.readFileSync(f);
+                  return b.length > 20 && b.readUInt16LE(18) === 40;
+                });
+                if (!arms.length) {
+                  console.error("无 ARM ELF，候选: " + nodes.map((f) => path.basename(f)).join(","));
+                  process.exit(1);
+                }
+                console.log(arms.map((f) => path.basename(f)).join(","));
+              ' "$d" >/dev/null && ok "$2 含 ARM ELF（供 $1）" || report "$2 无 ARM 二进制（供 $1）"
             }
 
             check_elf bcrypt     bcrypt
@@ -176,6 +188,14 @@ jobs:
 
             node -e "require(\"bcrypt\"); require(\"serialport\"); require(\"i2c-bus\"); require(\"evdev\"); console.log(\"ok:   原生模块可加载\")" \
               || report "原生模块无法 require"
+
+            # require 成功不代表绑定可用；真正调一次串口枚举，确保
+            # @serialport/bindings-cpp 能在 armhf 上实际运行
+            node -e "
+              const { SerialPort } = require(\"serialport\");
+              SerialPort.list().then((p) => console.log(\"ok:   串口枚举可用（\" + p.length + \" 个）\"))
+                .catch((e) => { console.error(e.message); process.exit(1); });
+            " || report "串口绑定无法运行"
 
             # 视频后端
             command -v ustreamer >/dev/null && ok "ustreamer 存在" || report "缺少 ustreamer"

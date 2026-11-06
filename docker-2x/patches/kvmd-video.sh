@@ -17,6 +17,11 @@
 
 set -u
 
+if [ "$#" -ne 7 ]; then
+    echo "Usage: $0 <ustreamer_bin> <port> <fps> <quality> <kbps> <gop> <resolution>"
+    exit 1
+fi
+
 ustreamer_bin=$1
 port=$2
 fps=$3
@@ -90,11 +95,6 @@ wait_network() {
 }
 
 # ---- 主流程 ----------------------------------------------------------------
-if [ "$#" -ne 7 ]; then
-    echo "Usage: $0 <ustreamer_bin> <port> <fps> <quality> <kbps> <gop> <resolution>"
-    exit 1
-fi
-
 if [ ! -x "$ustreamer_bin" ]; then
     log "ERROR: ustreamer 不可执行: $ustreamer_bin"
     exit 1
