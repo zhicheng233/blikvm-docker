@@ -58,10 +58,14 @@ bash -n "$APP_DIR/lib/kvmd-video.sh" \
 # 3. 原生模块必须是 armhf 机器码
 # ---------------------------------------------------------------------------
 # 读 ELF 头而不是调 readelf，避免为了一个检查往 slim 镜像里塞 binutils。
-# e_machine = 40 (EM_ARM) 才是 armhf；64 是 AArch64，62 是 x86_64。
+# e_machine = 40 (EM_ARM) 才是 armhf；183 是 AArch64，62 是 x86_64。
+#
+# 辅助脚本必须写在 $APP_DIR 里，不能放 /tmp：
+# Node 按「脚本所在目录」向上查找 node_modules，放到 /tmp 会找不到
+# 依赖，表现为 Cannot find module，与架构无关却会误报。
 echo "--- 原生模块架构 ---"
 
-cat > /tmp/check-elf.cjs <<'EOF'
+cat > "$APP_DIR/.verify-check-elf.cjs" <<'EOF'
 const fs = require('fs');
 const path = require('path');
 
@@ -85,9 +89,9 @@ if (!nodes.length) {
   process.exit(1);
 }
 
+// 该包可能同时带多个平台的预编译文件，只要有一个是 ARM 即算通过
 const arms = nodes.filter((f) => {
   const b = fs.readFileSync(f);
-  // ELF magic 之后再读 e_machine（偏移 18，小端）
   return b.length > 20 && b[0] === 0x7f && b[1] === 0x45 && b.readUInt16LE(18) === 40;
 });
 
@@ -101,7 +105,7 @@ console.log(arms.map((f) => path.basename(f)).join(', '));
 EOF
 
 check_elf() {  # $1=对外显示名  $2=实际含绑定的包目录
-    if out=$(node /tmp/check-elf.cjs "$APP_DIR/node_modules/$2" "$1" 2>&1); then
+    if out=$(node "$APP_DIR/.verify-check-elf.cjs" "$APP_DIR/node_modules/$2" "$1" 2>&1); then
         ok "$1 ($out)"
     else
         report "$1 不是 armhf 二进制: $out"
@@ -109,8 +113,7 @@ check_elf() {  # $1=对外显示名  $2=实际含绑定的包目录
 }
 
 check_elf bcrypt     bcrypt
-# serialport v12 是纯 JS 包装，真正的绑定在 @serialport/bindings-cpp，
-# 且该包可能同时带其它平台的占位文件，所以上面的脚本扫描整个包再判断。
+# serialport v12 是纯 JS 包装，真正的绑定在 @serialport/bindings-cpp
 check_elf serialport "@serialport/bindings-cpp"
 check_elf i2c-bus    i2c-bus
 check_elf evdev      evdev
@@ -120,10 +123,10 @@ check_elf evdev      evdev
 # ---------------------------------------------------------------------------
 echo "--- 原生模块运行时 ---"
 
-cat > /tmp/run-native.cjs <<'EOF'
+cat > "$APP_DIR/.verify-run-native.cjs" <<'EOF'
 const checks = [];
 
-// bcrypt：真正算一次哈希，静态链接的崩溃只会在调用时暴露
+// bcrypt：真正算一次哈希，静态链接问题只在调用时暴露
 try {
   const bcrypt = require('bcrypt');
   const hash = bcrypt.hashSync('blikvm-smoke-test', 4);
@@ -134,7 +137,7 @@ try {
   process.exitCode = 1;
 }
 
-// serialport：只验证模块可加载，枚举在下面单独异步执行
+// serialport：加载本身会进入绑定层
 try {
   require('serialport');
   checks.push('serialport 已加载');
@@ -164,7 +167,7 @@ try {
 for (const c of checks) console.log(`  ${c}`);
 EOF
 
-if out=$(cd "$APP_DIR" && node /tmp/run-native.cjs 2>&1); then
+if out=$(node "$APP_DIR/.verify-run-native.cjs" 2>&1); then
     echo "$out"
     ok "原生模块运行时检查通过"
 else
@@ -172,8 +175,8 @@ else
     report "原生模块运行时检查失败"
 fi
 
-# 串口枚举单独跑，异步失败需要单独捕获
-cat > /tmp/list-serial.cjs <<'EOF'
+# 串口枚举是异步的，单独跑一次以捕获绑定层的运行期错误
+cat > "$APP_DIR/.verify-list-serial.cjs" <<'EOF'
 const { SerialPort } = require('serialport');
 SerialPort.list()
   .then((ports) => {
@@ -186,13 +189,15 @@ SerialPort.list()
   });
 EOF
 
-if out=$(cd "$APP_DIR" && node /tmp/list-serial.cjs 2>&1); then
+if out=$(node "$APP_DIR/.verify-list-serial.cjs" 2>&1); then
     echo "$out"
     ok "串口枚举可用"
 else
     echo "$out"
     report "串口枚举失败"
 fi
+
+rm -f "$APP_DIR"/.verify-*.cjs
 
 # ---------------------------------------------------------------------------
 # 5. 视频后端与运行期依赖
@@ -202,7 +207,7 @@ echo "--- 视频后端 ---"
 command -v ustreamer >/dev/null && ok "ustreamer 存在" || report "缺少 ustreamer"
 ustreamer --help >/dev/null 2>&1 && ok "ustreamer 可执行" || report "ustreamer 无法运行"
 
-# Debian 的 armhf ustreamer 不带 x264，这一点要在构建期就明确，
+# Debian armhf 的 ustreamer 不带 x264，这一点要在构建期就明确，
 # 避免运行时才发现只能软编
 if ustreamer --help 2>&1 | grep -qi "LIBX264"; then
     ok "ustreamer 含 x264 编码器"
