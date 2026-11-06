@@ -153,18 +153,26 @@ jobs:
 
             # 原生模块必须是 armhf 的 ELF (e_machine=40/EM_ARM) 且能真正 require。
             # 用 node 读 ELF 头，避免为了 readelf 往 slim 镜像里塞 binutils。
-            for m in bcrypt serialport i2c-bus evdev; do
-              d=/opt/blikvm/node_modules/$m
-              [ -d "$d" ] || { report "$m 未安装"; continue; }
+            #
+            # 注意 serialport v12 是纯 JS 包装，真正的 .node 绑定在
+            # @serialport/bindings-cpp 里，所以按「包的依赖树」而不是包目录找产物。
+            check_elf() {  # $1=被检包名  $2=产物所在包目录
+              d="/opt/blikvm/node_modules/$2"
+              [ -d "$d" ] || { report "$2 未安装（$1 依赖）"; return; }
               f=$(find "$d" -name "*.node" -type f | head -1)
-              [ -n "$f" ] || { report "$m 没有 .node 产物"; continue; }
+              [ -n "$f" ] || { report "$2 没有 .node 产物（$1 依赖）"; return; }
               node -e "
                 const fs = require(\"fs\");
                 const b = fs.readFileSync(process.argv[1]);
                 const m = b.readUInt16LE(18);
                 if (m !== 40) { console.error(\"e_machine=\" + m); process.exit(1); }
-              " "$f" && ok "$m 是 ARM ELF" || report "$m 不是 ARM 二进制"
-            done
+              " "$f" && ok "$2 是 ARM ELF（供 $1）" || report "$2 不是 ARM 二进制"
+            }
+
+            check_elf bcrypt     bcrypt
+            check_elf serialport "@serialport/bindings-cpp"
+            check_elf i2c-bus    i2c-bus
+            check_elf evdev      evdev
 
             node -e "require(\"bcrypt\"); require(\"serialport\"); require(\"i2c-bus\"); require(\"evdev\"); console.log(\"ok:   原生模块可加载\")" \
               || report "原生模块无法 require"
