@@ -14,7 +14,7 @@ ARG BLIKVM_REF=cecede74ebe75239576c5eebf2eed7c4003a26fa
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git ca-certificates python3 curl \
         nodejs npm node-gyp build-essential pkg-config \
-        libudev-dev libi2c-dev \
+        libudev-dev libi2c-dev libffi-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
