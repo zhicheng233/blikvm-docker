@@ -54,10 +54,11 @@ fi
 # 残留任何 import 都会让进程在加载期崩溃
 grep -q "koffi.load('libxkbcommon" "$APP_DIR/src/modules/hid/printer.js" \
     && ok "printer.js 使用 koffi" || report "printer.js 未改用 koffi"
-if grep -q "ffi-napi" "$APP_DIR/src/modules/hid/printer.js"; then
-    report "printer.js 仍引用 ffi-napi"
+# 只匹配真正的 import/require，注释里提到 ffi-napi 不算引用
+if grep -qE "from 'ffi-napi'|require\('ffi-napi'\)" "$APP_DIR/src/modules/hid/printer.js"; then
+    report "printer.js 仍 import ffi-napi"
 else
-    ok "printer.js 无 ffi-napi 残留"
+    ok "printer.js 无 ffi-napi 引用"
 fi
 
 # ---------------------------------------------------------------------------

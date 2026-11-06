@@ -321,7 +321,8 @@ grep -q "pick_capture_device" lib/kvmd-video.sh || die "kvmd-video.sh 未被替�
 # 只要还有一处 import 残留，容器启动就会在加载期崩溃
 grep -q "koffi.load('libxkbcommon" src/modules/hid/printer.js \
     || die "printer.js 的 koffi 补丁未生效"
-if grep -q "ffi-napi" src/modules/hid/printer.js; then
+# 只匹配真正的 import/require，注释里提到 ffi-napi 不算引用
+if grep -qE "from 'ffi-napi'|require\('ffi-napi'\)" src/modules/hid/printer.js; then
     die "printer.js 仍引用 ffi-napi"
 fi
 

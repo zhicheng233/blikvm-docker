@@ -199,6 +199,7 @@ const printerChecks = [
   { desc: '移除 ref-napi import',   ok: !patched.includes("from 'ref-napi'") },
   { desc: '移除 ref.types.uint32',  ok: !patched.includes('ref.types') },
   { desc: '移除 ffi.Library 调用',  ok: !patched.includes('ffi.Library') },
+  { desc: '注释不算引用（只查 import/require）', ok: !/from 'ffi-napi'|require\('ffi-napi'\)/.test(patched) },
   { desc: '引入 koffi',             ok: patched.includes("from 'koffi'") },
   { desc: 'koffi 绑定 libxkbcommon', ok: patched.includes("koffi.load('libxkbcommon.so.0')") },
   { desc: '声明 xkb_utf32_to_keysym', ok: patched.includes('const xkb_utf32_to_keysym =') },
