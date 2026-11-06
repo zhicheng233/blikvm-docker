@@ -159,6 +159,27 @@ jobs:
             docker push "$t"
           done
 
+      # 目标板（OneCloud）跨境拉 GHCR 实测只有几十 KB/s，镜像几乎拉不下来。
+      # 导出成 tar.zst 当 artifact 走局域网，比反复重试 pull 可靠得多。
+      - name: Export image tarball
+        run: |
+          set -eu
+          out="blikvm-2x-armhf.tar.zst"
+          docker save "$LOCAL_TAG" | zstd -3 -T0 -o "$out"
+          ls -lh "$out"
+          sha256sum "$out" | tee "$out.sha256"
+
+      - name: Upload image tarball
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: blikvm-2x-armhf-image
+          path: |
+            blikvm-2x-armhf.tar.zst
+            blikvm-2x-armhf.tar.zst.sha256
+          retention-days: 14
+          compression-level: 0
+
       - name: Summary
         run: |
           {
@@ -173,5 +194,10 @@ jobs:
               echo '```'
             fi
             echo ""
-            echo "目标板拉取: \`docker pull $IMAGE:2.x-armhf\`"
+            echo "目标板在线拉取（可能需要代理）: \`docker pull $IMAGE:2.x-armhf\`"
+            echo ""
+            echo "或下载 artifact \`blikvm-2x-armhf-image\` 后离线导入:"
+            echo '```'
+            echo 'zstd -d blikvm-2x-armhf.tar.zst | docker load'
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
