@@ -41,19 +41,48 @@ docker-2x/
 │   ├── apply-patches.sh            # 幂等打补丁脚本，构建期执行
 │   └── kvmd-video.sh               # 替换上游：支持未知板型 + 源分辨率直出
 ├── tests/
-│   └── patch-logic.test.mjs        # 板型判断与分辨率策略的纯逻辑测试
+│   ├── patch-logic.test.mjs        # 板型判断与分辨率策略的纯逻辑测试
+│   └── verify-image.sh             # 镜像内冒烟测试（CI 里跑）
 └── README.md
 ```
 
-## 快速开始
+## 获取镜像
+
+镜像由 GitHub Actions 构建（`.github/workflows/build-docker-2x.yml`），
+不依赖任何一台本地机器：目标板只有 1 GB 内存，本地机器也没有 armhf 工具链。
+
+两种获取方式：
 
 ```bash
-git clone https://github.com/zhicheng233/blikvm-docker.git -b docker-2x
-cd blikvm-docker/docker-2x
-docker compose up -d --build
+# 1) 在线拉取（需要能访问 GHCR）
+docker pull ghcr.io/zhicheng233/blikvm-2x-armhf:2.x-armhf
+
+# 2) 离线导入（推荐：目标板跨境拉取实测只有 ~150 KB/s）
+#    从 Actions 的 artifact "blikvm-2x-armhf-image" 下载后：
+zstd -d blikvm-2x-armhf.tar.zst | docker load
+```
+
+CI 每次构建都会先跑冒烟测试再推送，验证内容包括：三个补丁确实落进镜像、
+补丁后的 JS 仍能通过 `node --check`、四个原生模块是 armhf ELF 且能实际调用
+（bcrypt 真算一次哈希、serialport 真枚举串口）、ustreamer 可执行、入口脚本可执行。
+任一失败则不推送镜像。
+
+自行构建（需要 armhf 环境或 QEMU binfmt）：
+
+```bash
+cd docker-2x
+docker build --build-arg BLIKVM_REF=<commit> -t blikvm:2.x-armhf .
+```
+
+## 运行
+
+```bash
+cd docker-2x
+docker compose up -d
 ```
 
 访问 `https://<host-ip>/`，默认账号见上游文档。
+
 
 ## 打了哪些补丁
 
@@ -94,10 +123,19 @@ docker compose up -d --build
 | 补丁逻辑（板型判断 / 分辨率策略） | ✅ 10/10 通过（`node --test tests/`） |
 | 补丁脚本幂等性 | ✅ 重复执行正确跳过 |
 | 打补丁后 JS 语法 | ✅ `node --check` 通过 |
-| 镜像构建（OneCloud） | ⏳ 待验证 |
+| 镜像构建（GitHub Actions, linux/arm/v7） | ✅ 构建通过 |
+| 镜像内冒烟测试 | ✅ 补丁 / ELF 架构 / 原生模块调用 / 视频后端 / 入口 |
+| 容器启动（有硬件） | ⏳ 待验证 |
 | 真机 MJPEG 帧率 / CPU 占用 | ⏳ 待验证 |
+| HID 键鼠与 MSD 虚拟介质 | ⏳ 待验证 |
 
 尚未在真机上验证的部分会明确标注，不提前声称可用。
+
+构建期已经抓到并修掉的两个真实缺陷，都出在运行阶段而不是补丁逻辑：
+
+- `evdev` 被 `src/index.js` 无条件间接 import，缺失会让服务直接崩溃
+  （不是可选项，必须一起编译）
+- 运行镜像缺 `udevadm`，`SerialPort.list()` 会失败，串口/ATX 功能不可用
 
 
 ## 设计要点
@@ -132,8 +170,15 @@ docker compose up -d --build
 Debian armhf 的 `ustreamer` 不含 x264（编码器只有 CPU/HW/M2M-*/NOOP）。
 上游 H616 版的 `ustreamer.bin` 虽然带 `libx264.so.163`，但是 arm64 二进制。
 
-需要 H.264 时可自行编译带 x264 的 ustreamer（Dockerfile 预留 `WITH_X264` 参数），
+需要 H.264 时可自行编译带 x264 的 ustreamer（Debian 有 `libx264-dev`），
 但 Cortex-A5 @1.5GHz 做 1080p 实时编码不现实。
+
+### 上游版本固定
+
+`Dockerfile` 的 `BLIKVM_REF` 与 workflow 的 `UPSTREAM_REF`
+都固定到 `blikvm-web-server` 的提交 `cecede74`（2025-12-18，最后一个非 alpha 的
+master 快照）。上游若更新，需要同步改这两处并重新验证补丁是否仍能打上。
+
 
 ## 与上游的关系
 
