@@ -1,0 +1,34 @@
+# 原生模块编译探测镜像
+#
+# 复用正式镜像的构建阶段拿到源码树和 armhf 工具链，
+# 然后逐个尝试编译那些「没有预编译产物」的原生模块。
+#
+# 与正式 Dockerfile 分开，是为了不把探测用的编译工具链带进发布镜像。
+
+FROM arm32v7/debian:trixie-slim
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG BLIKVM_REPO=https://github.com/blikvm/blikvm-web-server.git
+ARG BLIKVM_REF=cecede74ebe75239576c5eebf2eed7c4003a26fa
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git ca-certificates python3 curl \
+        nodejs npm build-essential pkg-config \
+        libudev-dev libi2c-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+RUN git init --quiet blikvm && cd blikvm \
+    && git remote add origin "$BLIKVM_REPO" \
+    && { git fetch --depth 1 origin "$BLIKVM_REF" || git fetch origin "$BLIKVM_REF"; } \
+    && git checkout --quiet --detach FETCH_HEAD \
+    && cd /src && rm -rf blikvm/.git
+
+WORKDIR /src/blikvm
+# 用 ignore-scripts 装完依赖，再逐个手动编译，这样能单独观察每个模块的结果
+RUN npm install --omit=dev --no-audit --no-fund --ignore-scripts
+
+COPY tests/probe.sh /probe.sh
+RUN chmod +x /probe.sh
+
+ENTRYPOINT ["/probe.sh"]
