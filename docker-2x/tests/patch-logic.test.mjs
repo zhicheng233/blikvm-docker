@@ -362,5 +362,88 @@ const emptySpawnThrows = (() => {
 if (!emptySpawnThrows) failed++;
 console.log(`${emptySpawnThrows ? 'PASS' : 'FAIL'}  index.js spawn('') 确实同步抛错（故需前置跳过）`);
 
+// ---------------------------------------------------------------------------
+// 前端补丁：诊断浮层退出 Vuetify 全局 z-index 栈
+//
+// 没插采集卡时，「未检测到信号」浮层一直挂在 Vuetify 的全局 overlay 栈上，
+// 它的 z-index 取自应用的 zIndex.diagnostics = 700。Vuetify 的 useStack 会给
+// 之后打开的菜单取「栈顶 + 10」= 710，而嵌套 v-layout 的抽屉算出来是 904。
+// 710 < 904 → 抽屉里的下拉菜单整块被抽屉盖住，看起来就是「点了没反应」。
+//
+// 补丁让这个纯展示浮层不参与全局栈，菜单回落到自己的默认值。
+// ---------------------------------------------------------------------------
+const DIAG_FIXTURE = `<template>
+  <v-overlay
+    :model-value="showDiagnostics"
+    :opacity="0"
+    contained
+    content-class="d-flex flex-column align-center justify-end w-100 h-100"
+  >
+    <v-spacer />
+  </v-overlay>
+</template>
+`;
+
+function patchDiagnostics(raw) {
+  if (raw.includes('_disable-global-stack')) return raw;
+  const lines = raw.split('\n');
+  const at = lines.findIndex((l) => l.includes(':opacity="0"'));
+  if (at === -1) throw new Error('锚点缺失');
+  const indent = lines[at].match(/^[ \t]*/)[0];
+  lines.splice(at + 1, 0, `${indent}:_disable-global-stack="true"`);
+  return lines.join('\n');
+}
+
+const diagPatched = patchDiagnostics(DIAG_FIXTURE);
+const diagTwice = patchDiagnostics(diagPatched);
+const diagLines = diagPatched.split('\n');
+const diagChecks = [
+  { desc: '注入 _disable-global-stack', ok: diagPatched.includes(':_disable-global-stack="true"') },
+  {
+    desc: '落在 v-overlay 标签内',
+    ok: (() => {
+      const open = diagLines.findIndex((l) => l.trim().startsWith('<v-overlay'));
+      const close = diagLines.findIndex((l) => l.trim() === '>');
+      const attr = diagLines.findIndex((l) => l.includes('_disable-global-stack'));
+      return open !== -1 && close !== -1 && attr > open && attr < close;
+    })(),
+  },
+  { desc: '保持缩进一致', ok: diagLines.find((l) => l.includes('_disable-global-stack')).startsWith('    :') },
+  { desc: '幂等', ok: diagPatched === diagTwice },
+  { desc: '只注入一次', ok: diagLines.filter((l) => l.includes('_disable-global-stack')).length === 1 },
+  { desc: '不改动其他内容', ok: diagPatched.includes(':model-value="showDiagnostics"') && diagPatched.includes('contained') },
+  { desc: '锚点缺失时抛错', ok: (() => { try { patchDiagnostics('<template>\n  <v-overlay>\n'); return false; } catch { return true; } })() },
+];
+console.log('');
+for (const c of diagChecks) {
+  if (!c.ok) failed++;
+  console.log(`${c.ok ? 'PASS' : 'FAIL'}  AppDiagnosticsSignal.vue ${c.desc}`);
+}
+
+// ---------------------------------------------------------------------------
+// 前端补丁：语言下拉的中文标签
+//
+// 上游把 zh 的 label 写成「中国人」，下拉里看着像选国籍而不是选语言，
+// 中文用户很容易以为没有中文可选。
+// ---------------------------------------------------------------------------
+function patchLangLabel(raw) {
+  return raw.replace("label: '中国人'", "label: '中文'");
+}
+
+const langFixture = "  { language: 'zh', ocr: 'chi_sim', label: '中国人' },";
+const langPatched = patchLangLabel(langFixture);
+const langChecks = [
+  { desc: '标签改为中文',   ok: langPatched.includes("label: '中文'") },
+  { desc: '无中国人残留',   ok: !langPatched.includes('中国人') },
+  { desc: '保留 language', ok: langPatched.includes("language: 'zh'") },
+  { desc: '保留 ocr',      ok: langPatched.includes("ocr: 'chi_sim'") },
+  { desc: '幂等',          ok: patchLangLabel(langPatched) === langPatched },
+];
+console.log('');
+for (const c of langChecks) {
+  if (!c.ok) failed++;
+  console.log(`${c.ok ? 'PASS' : 'FAIL'}  useLanguage.js ${c.desc}`);
+}
+
 console.log(`\n${failed === 0 ? '全部通过' : failed + ' 项失败'}`);
 process.exit(failed === 0 ? 0 : 1);

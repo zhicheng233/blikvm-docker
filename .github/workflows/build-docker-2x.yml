@@ -53,6 +53,15 @@ jobs:
       - name: Run patch logic tests
         run: node --test docker-2x/tests/patch-logic.test.mjs
 
+      # 补丁脚本本身也要能通过语法检查（Docker 构建里的报错更贵）
+      - name: Shell syntax check
+        run: |
+          bash -n docker-2x/patches/apply-patches.sh
+          bash -n docker-2x/patches/apply-web-patches.sh
+          bash -n docker-2x/patches/kvmd-video.sh
+          bash -n docker-2x/entrypoint.sh
+          bash -n docker-2x/tests/verify-image.sh
+
   image:
     name: Build, verify and publish
     needs: patch-tests

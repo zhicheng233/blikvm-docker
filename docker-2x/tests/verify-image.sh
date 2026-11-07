@@ -337,6 +337,27 @@ else
     report "缺少前端产物 src/server/dist/index.html"
 fi
 
+# 前端补丁必须真的进了产物（压缩后字符串仍在，直接查产物）：
+#   - 诊断浮层不参与 Vuetify 全局 z-index 栈，否则没插采集卡时抽屉里的
+#     下拉菜单会被抽屉盖住（点是没反应）
+#   - 语言下拉的中文标签应是「中文」而不是上游的「中国人」
+DIST_ASSETS="$APP_DIR/src/server/dist/assets"
+if [ -d "$DIST_ASSETS" ]; then
+    if grep -rq "_disableGlobalStack" "$DIST_ASSETS"; then
+        ok "前端补丁生效：诊断浮层不占全局 z-index 栈"
+    else
+        report "前端补丁缺失：dist 里没有 _disableGlobalStack，设置面板下拉会被抽屉盖住"
+    fi
+
+    if grep -rq "中国人" "$DIST_ASSETS"; then
+        report "前端补丁缺失：dist 里仍有「中国人」语言标签"
+    else
+        ok "前端补丁生效：语言标签已修正"
+    fi
+else
+    report "缺少前端产物目录 assets"
+fi
+
 echo
 if [ "$rc" -eq 0 ]; then
     echo "全部检查通过"

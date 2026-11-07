@@ -39,6 +39,14 @@ RUN git init --quiet . \
          || git fetch origin "$WEB_CLIENT_REF"; } \
     && git checkout --quiet --detach FETCH_HEAD
 
+# 构建期给前端打补丁（幂等 + fail closed）：
+#   - 诊断浮层退出 Vuetify 全局 z-index 栈，否则没插采集卡时
+#     设置抽屉里的所有下拉框都会被抽屉盖住（点了没反应）
+#   - 语言下拉里的「中国人」标签修正为「中文」
+COPY patches/apply-web-patches.sh /opt/web-patches/apply-web-patches.sh
+RUN chmod +x /opt/web-patches/apply-web-patches.sh \
+    && /opt/web-patches/apply-web-patches.sh /web
+
 # husky 的 prepare 钩子在没有 .git 钩子的构建环境里会失败，与产物无关
 ENV HUSKY=0
 RUN npm ci --no-audit --no-fund \
@@ -46,6 +54,12 @@ RUN npm ci --no-audit --no-fund \
 
 # 构建产物必须存在：缺失说明前端构建悄悄失败了，不能在最后才暴露
 RUN test -f /web/dist/index.html
+
+# 补丁必须真的进了产物：标签修正 + 诊断浮层退出全局栈。
+# 前端是压缩产物，字符串仍在，直接校验最终文件而不是源码。
+RUN ! grep -rq "中国人" /web/dist/assets \
+    && grep -rq "中文" /web/dist/assets \
+    && grep -rq "_disableGlobalStack" /web/dist/assets
 
 # ---------------------------------------------------------------------------
 # 构建阶段：拉源码 + 打补丁

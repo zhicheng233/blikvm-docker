@@ -52,10 +52,11 @@ docker-2x/
 ├── docker-compose.yml              # 特权模式 + /dev、/sys、/lib/modules 直通
 ├── entrypoint.sh                   # 容器启动：环境自检、目录准备、拉起服务
 ├── patches/
-│   ├── apply-patches.sh            # 幂等打补丁脚本，构建期执行
+│   ├── apply-patches.sh            # 幂等打服务端补丁，构建期执行
+│   ├── apply-web-patches.sh        # 幂等打前端补丁，前端阶段构建前执行
 │   └── kvmd-video.sh               # 替换上游：支持未知板型 + 源分辨率直出
 ├── tests/
-│   ├── patch-logic.test.mjs        # 补丁逻辑纯函数测试（49 项）
+│   ├── patch-logic.test.mjs        # 补丁逻辑纯函数测试（62 项）
 │   └── verify-image.sh             # 镜像内冒烟测试（CI 里跑）
 └── README.md
 ```
@@ -78,10 +79,11 @@ zstd -d blikvm-2x-armhf.tar.zst | docker load
 
 CI 每次构建都会先跑冒烟测试再推送，验证内容包括：
 
-- 8 个补丁确实落进镜像；补丁后的 JS 仍能通过 `node --check`
+- 8 个服务端补丁确实落进镜像；补丁后的 JS 仍能通过 `node --check`
 - 六个原生模块是 armhf ELF 且能实际调用（bcrypt 真算一次哈希、
   serialport 真枚举串口、koffi 真打开 `libxkbcommon` 并调用）
 - 前端产物 `src/server/dist/index.html` 存在（缺失会让整个 Web 界面 404）
+- 前端补丁进了产物：`_disableGlobalStack` 存在、`中国人` 标签已消失
 - `ustreamer` / `modprobe` / `v4l2-ctl` / `ffmpeg` 可用；入口脚本可执行
 
 任一失败则不推送镜像。
@@ -120,7 +122,9 @@ ls /dev/video*             # 插上采集卡之后才有
 
 上游代码把硬件型号写死了，非官方板直接失效；另有一个 FFI 依赖在新版 Node 上
 根本编译不出来；还有几处只有在「直接跑源码而不是 pkg 二进制」时才会暴露。
-本方案共 8 处，全部由 `patches/apply-patches.sh` 在构建期完成。
+本方案共 8 处服务端补丁，全部由 `patches/apply-patches.sh` 在构建期完成；
+另有 2 处前端补丁，由 `patches/apply-web-patches.sh` 在前端阶段构建前完成
+（见「[前端补丁](#前端补丁)」）。
 
 ### 1. `lib/kvmd-video.sh` —— 整份替换
 
@@ -233,21 +237,55 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
   在 armhf QEMU 里装几百 MB 依赖会慢到不可用，甚至把 1GB 的构建机拖死
 - 构建完断言 `dist/index.html` 存在，然后 `COPY` 到 `/opt/blikvm/src/server/dist`
 
+### 前端补丁
+
+`patches/apply-web-patches.sh` 在前端阶段 `npm run build` **之前**执行，
+同样是幂等 + fail closed（锚点找不到就退出，不让构建「成功」出一个坏前端）。
+
+**1. 设置面板里的下拉框点了没反应**（`src/components/AppDiagnosticsSignal.vue`）
+
+真机复现出来的现象：进入「设置 → 图形用户界面 → 语言」，点下拉框没有任何选项
+弹出。用浏览器调试后确认菜单**是被画出来了的**，只是整块压在左侧抽屉底下。
+
+成因是两套 z-index 撞车：
+
+| 来源 | 值 |
+|---|---|
+| 「未检测到信号」诊断浮层，取自 `src/styles/zIndex.js` 的 `diagnostics` | 700 |
+| Vuetify `useStack` 给之后打开的菜单取「栈顶 + 10」 | 710 |
+| 嵌套 `v-layout` 的抽屉（`rootZIndex - 100 = 900`，再加图层偏移） | 904 |
+
+710 < 904，菜单完全被抽屉遮住，`document.elementFromPoint()` 命中的是面板卡片
+而不是菜单项。**只要没插采集卡**（诊断浮层一直显示）就会触发，插着卡的机器上
+浮层消失、菜单正常 —— 这也是上游一直没发现它的原因。
+
+修法：给这个纯展示用的浮层加 `:_disable-global-stack="true"`，让它不参与
+Vuetify 全局 overlay 栈，后续菜单回落到自己的默认 z-index。
+
+**2. 语言下拉里的标签写错了**（`src/composables/useLanguage.js`）
+
+上游把 `zh` 的 label 写成 `'中国人'`。下拉里显示的是「中国人」而不是「中文」，
+很容易让人以为这里没有中文选项。改为 `'中文'`。
+
+两项都在 CI 里对**最终产物**（压缩后的 `dist/assets`）做 grep 断言，
+而不是只检查源码 —— 保证补丁真的进了用户拿到的镜像。
+
 ## 验证状态
 
 | 项 | 状态 |
 |---|---|
-| 补丁逻辑（板型 / 分辨率 / 二进制路径 / koffi / ESM / 配置 / 子服务） | ✅ 49/49 通过（`node --test tests/`） |
+| 补丁逻辑（板型 / 分辨率 / 二进制路径 / koffi / ESM / 配置 / 子服务 / 前端） | ✅ 62/62 通过（`node --test tests/`） |
 | 补丁脚本幂等性 | ✅ 真机对镜像源码重复执行两遍，第二遍全部跳过 |
 | 打补丁后 JS 语法 | ✅ `node --check` 通过 |
 | 原生模块编译可行性（armhf + Node 20） | ✅ 探针实测：`unix-dgram`/`ref-napi` 可编，`ffi-napi`/`cpu-features` 不可编 |
 | 镜像构建（GitHub Actions, linux/arm/v7） | ✅ 构建通过 |
-| 镜像内冒烟测试 | ✅ 补丁 / ELF 架构 / 原生模块调用 / 前端 dist / 视频后端 / 入口 |
+| 镜像内冒烟测试 | ✅ 补丁 / ELF 架构 / 原生模块调用 / 前端 dist / 前端补丁 / 视频后端 / 入口 |
 | 容器启动（OneCloud 真机） | ✅ `Up (healthy)`，日志无 ERROR |
 | Web 界面 | ✅ `https://<ip>/` 200，静态资源 200，80 自动跳 443 |
 | 登录 | ✅ `POST /api/login` 200，JWT 签发、bcrypt 校验、`/api/auth/state` 200 |
 | HID gadget | ✅ `/dev/hidg0/1/2` 全部打开，`HID already running` |
 | 无采集卡时的行为 | ✅ 视频服务等待不退出，其余功能正常 |
+| 设置面板下拉（无采集卡） | ✅ 修复后语言菜单可见，点击可真实切换语言 |
 | MJPEG 实际出流 / 帧率 / CPU | ⏳ 待插采集卡验证 |
 | HID 键盘鼠标向目标机实际输入 | ⏳ 待验证 |
 | MSD 虚拟介质挂载 | ⏳ 待验证 |
@@ -265,6 +303,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
   日志写 stdout → 被 `$(pick_capture_device)` 当成设备名
 - 运行镜像缺 `udevadm` → `SerialPort.list()` 失败
 - `evdev` 被无条件 import → 缺失直接崩溃
+- 前端诊断浮层占用 Vuetify 全局 z-index 栈 → 没插采集卡时设置面板里所有
+  下拉框都被抽屉盖住（点了没反应，菜单其实在，只是看不见）
 
 ## 设计要点
 
