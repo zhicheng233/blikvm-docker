@@ -26,6 +26,12 @@ services:
     # 采集卡、UDC、loop 设备全部来自宿主 /dev
     volumes:
       - /dev:/dev
+      # configfs / sysfs 来自宿主：USB gadget（HID/MSD）要在 /sys/kernel/config
+      # 下建节点，必须看到宿主的 configfs，容器自己的 /sys 是空的
+      - /sys:/sys
+      # gadget.sh 会 modprobe libcomposite / usb_f_mass_storage，
+      # 需要宿主的模块目录与已加载的内核版本一致
+      - /lib/modules:/lib/modules:ro
       - blikvm-config:/data/config
       - blikvm-msd:/mnt/msd
       - blikvm-record:/mnt/tmp/record

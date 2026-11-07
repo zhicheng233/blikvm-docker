@@ -25,6 +25,10 @@ die() { echo "[patch] ERROR: $*" >&2; exit 1; }
 [ -f src/common/enums.js ] || die "找不到 src/common/enums.js"
 [ -f src/modules/update/app_default_config.js ] || die "找不到 app_default_config.js"
 [ -f src/modules/hid/printer.js ] || die "找不到 src/modules/hid/printer.js"
+[ -f src/server/server.js ] || die "找不到 src/server/server.js"
+[ -f src/index.js ] || die "找不到 src/index.js"
+[ -f config/app.json ] || die "找不到 config/app.json"
+[ -f config/switch.json ] || die "找不到 config/switch.json"
 
 # ---------------------------------------------------------------------------
 # 1) enums.js：新增 HardwareType.GENERIC
@@ -297,6 +301,219 @@ PY
 fi
 
 # ---------------------------------------------------------------------------
+# 3f) server.js：ESM 下没有 __dirname
+# ---------------------------------------------------------------------------
+# 上游用 pkg 把源码打包成 CommonJS，所以 server.js 里直接用了 CJS 的 __dirname
+# 来定位前端静态目录。本方案直接以 ESM 运行源码，该全局不存在，
+# getRootPath() 会在第一次请求时抛 ReferenceError 让进程退出。
+if grep -q "fileURLToPath(import.meta.url)" src/server/server.js; then
+    log "server.js 已打过补丁，跳过"
+else
+    log "打补丁: server.js 补回 ESM 下缺失的 __dirname"
+    python3 - <<'PY'
+import sys
+p = 'src/server/server.js'
+s = open(p, encoding='utf-8').read()
+
+anchor = "import path from 'path';"
+if anchor not in s:
+    sys.exit('server.js: 找不到 path import，上游结构可能已变化')
+
+inject = anchor + """
+import { fileURLToPath } from 'url';
+
+// 上游用 pkg 打包成 CommonJS，所以这里直接用了 CJS 的 __dirname。
+// 本方案以 ESM 运行源码，__dirname 不存在，必须从 import.meta.url 还原。
+// getRootPath() 靠它定位前端静态目录（<本文件所在目录>/dist）。
+const __dirname = path.dirname(fileURLToPath(import.meta.url));"""
+
+s = s.replace(anchor, inject, 1)
+open(p, 'w', encoding='utf-8').write(s)
+print('server.js patched')
+PY
+fi
+
+# ---------------------------------------------------------------------------
+# 3g) config/app.json：镜像自带的初始配置写死了 lib/pi 路径
+# ---------------------------------------------------------------------------
+# entrypoint 首次启动时把 config/*.json 复制到 /data/config，app_default_config.js
+# 只在版本升级时补缺失字段。所以真正生效的初始值来自这个文件，它把
+# ustreamer/janus/kvmd-main 全指向 ./lib/pi/...（aarch64 二进制，armhf 板跑不了）。
+if grep -q '"bin": "ustreamer"' config/app.json; then
+    log "config/app.json 已打过补丁，跳过"
+else
+    log "打补丁: config/app.json 通用板二进制路径"
+    python3 - <<'PY'
+import json, sys
+p = 'config/app.json'
+with open(p, encoding='utf-8') as f:
+    cfg = json.load(f)
+
+if 'video' not in cfg or 'kvmd' not in cfg or 'atx' not in cfg:
+    sys.exit('config/app.json: 缺少 video/kvmd/atx 段，上游结构可能已变化')
+
+# 通用板用系统 ustreamer（Debian armhf 包），janus/kvmd-main 无 armhf 产物，
+# 置空后由 src/index.js 的补丁跳过，而不是去 spawn 一个空路径把自己搞崩。
+cfg['video']['bin'] = 'ustreamer'
+cfg['video']['recordBin'] = ''
+cfg['video']['resolution'] = 'native'
+cfg['janus'] = {'bin': '', 'configsFolder': '', 'pluginsFolder': ''}
+cfg['kvmd'] = {'bin': ''}
+# ATX 依赖 kvmd-main 维护的状态文件，没有它就没有 ATX
+cfg['atx']['isActive'] = False
+cfg['deviceVersion'] = 'BliKVM 2.x (generic ARM)'
+
+with open(p, 'w', encoding='utf-8') as f:
+    json.dump(cfg, f, indent=2, ensure_ascii=False)
+    f.write('\n')
+print('config/app.json patched')
+PY
+fi
+
+# ---------------------------------------------------------------------------
+# 3g-2) config/switch.json：默认不启用 BliSwitch
+# ---------------------------------------------------------------------------
+# 默认配置里 kvmSwitch.isActive 是 true，指向 /dev/ttyUSB0 的 BliSwitch。
+# 通用板没有这个串口设备，启动时 startSwitch() 会先尝试初始化再报一条
+# 「Switch path /dev/ttyUSB0 doesn't exist」的 ERROR（随后它自己会把
+# isActive 改回 false）。这里直接把初始值关掉，避免每次全新部署都刷一次错误；
+# 需要外接切换器时在界面上重新启用即可。
+if grep -q '"isActive": false' config/switch.json; then
+    log "config/switch.json 已打过补丁，跳过"
+else
+    log "打补丁: config/switch.json 默认关闭 BliSwitch"
+    python3 - <<'PY'
+import json, sys
+p = 'config/switch.json'
+with open(p, encoding='utf-8') as f:
+    cfg = json.load(f)
+
+if 'kvmSwitch' not in cfg:
+    sys.exit('config/switch.json: 缺少 kvmSwitch 段，上游结构可能已变化')
+cfg['kvmSwitch']['isActive'] = False
+
+with open(p, 'w', encoding='utf-8') as f:
+    json.dump(cfg, f, indent=2, ensure_ascii=False)
+    f.write('\n')
+print('config/switch.json patched')
+PY
+fi
+
+# ---------------------------------------------------------------------------
+# 3h) index.js：可选子服务的失败不能拖垮主进程
+# ---------------------------------------------------------------------------
+# 上游把 video / kvmd-main / janus / ATX 都当必选服务：
+#   - startService() 多数调用点没有 .catch()，任一子进程以 code 1 退出
+#     就会产生未处理的 Promise rejection，Node 20 直接终止进程；
+#   - janus / kvmd-main 在通用板上没有可执行文件，spawn('') 会同步抛
+#     ERR_INVALID_ARG_VALUE；
+#   - ATX 无条件 fs.watch('/dev/shm/blikvm/atx')，该文件由 kvmd-main 创建，
+#     不存在时抛 ENOENT 同样终止进程。
+# 这里只补齐失败处理与「未配置就跳过」，不改变任何业务行为。
+if grep -q "isKvmdMainConfigured" src/index.js; then
+    log "index.js 已打过补丁，跳过"
+else
+    log "打补丁: index.js 子服务失败隔离"
+    python3 - <<'PY'
+import sys
+p = 'src/index.js'
+s = open(p, encoding='utf-8').read()
+
+# 3h-1) video / kvmd-main：补 .catch()
+old = """  const video = new Video();
+  video.startService();
+  const kvmdmain = new KVMDMain();
+  kvmdmain.startService();"""
+new = """  const video = new Video();
+  video.startService().catch((e) => {
+    logger.error(`video service failed: ${e && e.msg ? e.msg : e}`);
+  });
+  const kvmdmain = new KVMDMain();
+  if (isKvmdMainConfigured()) {
+    kvmdmain.startService().catch((e) => {
+      logger.error(`kvmd-main service failed: ${e && e.msg ? e.msg : e}`);
+    });
+  } else {
+    logger.warn('kvmd-main 未配置可执行文件，跳过（上游只提供 aarch64 二进制）');
+  }"""
+if old not in s:
+    sys.exit('index.js: 找不到 video/kvmdmain 启动块，上游结构可能已变化')
+s = s.replace(old, new, 1)
+
+# 3h-2) janus 调用点：async 函数必须 catch
+old = """  startJanus();
+  startSwitch();"""
+new = """  startJanus().catch((e) => {
+    logger.error(`janus start failed: ${e && e.msg ? e.msg : e}`);
+  });
+  startSwitch();"""
+if old not in s:
+    sys.exit('index.js: 找不到 startJanus 调用点，上游结构可能已变化')
+s = s.replace(old, new, 1)
+
+# 3h-3) startJanus 本体：未配置 bin 直接跳过，否则 spawn('') 抛异常
+old = """async function startJanus(){
+  await killProcessByName('janus', { fullMatch: false, termTimeout: 1000 });
+  const janus = new Janus();
+  janus.startService();
+}"""
+new = """async function startJanus(){
+  const { janus: janusCfg } = JSON.parse(fs.readFileSync(CONFIG_PATH, UTF8));
+  if (!janusCfg || !janusCfg.bin) {
+    logger.warn('janus 未配置可执行文件，跳过（本方案走 MJPEG，不用 WebRTC）');
+    return;
+  }
+  await killProcessByName('janus', { fullMatch: false, termTimeout: 1000 });
+  const janusService = new Janus();
+  await janusService.startService().catch((e) => {
+    logger.error(`janus service failed: ${e && e.msg ? e.msg : e}`);
+  });
+}"""
+if old not in s:
+    sys.exit('index.js: 找不到 startJanus 函数，上游结构可能已变化')
+s = s.replace(old, new, 1)
+
+# 3h-4) ATX：没有 kvmd-main 就没有状态文件，fs.watch 会抛 ENOENT
+old = """  const atx = new ATX();
+  setTimeout(() => {
+    atx.startService();"""
+new = """  const atx = new ATX();
+  setTimeout(() => {
+    // ATX 监视 /dev/shm/blikvm/atx，该文件由 kvmd-main 创建；
+    // 没有 kvmd-main 时 fs.watch 抛 ENOENT 会直接终止整个进程
+    if (isKvmdMainConfigured()) {
+      atx.startService();
+    } else {
+      logger.warn('kvmd-main 不可用，跳过 ATX 状态监视（ATX 电源控制不可用）');
+    }"""
+if old not in s:
+    sys.exit('index.js: 找不到 ATX 启动块，上游结构可能已变化')
+s = s.replace(old, new, 1)
+
+# 3h-5) 辅助函数
+old = "// function start switch\nfunction startSwitch() {"
+new = """// kvmd-main 是否配置了可执行文件（通用板为空，表示该守护进程不可用）
+function isKvmdMainConfigured() {
+  try {
+    const { kvmd } = JSON.parse(fs.readFileSync(CONFIG_PATH, UTF8));
+    return Boolean(kvmd && kvmd.bin);
+  } catch (e) {
+    return false;
+  }
+}
+
+// function start switch
+function startSwitch() {"""
+if old not in s:
+    sys.exit('index.js: 找不到 startSwitch，上游结构可能已变化')
+s = s.replace(old, new, 1)
+
+open(p, 'w', encoding='utf-8').write(s)
+print('index.js patched')
+PY
+fi
+
+# ---------------------------------------------------------------------------
 # 4) 用适配版视频脚本替换上游版本
 # ---------------------------------------------------------------------------
 if [ -f "$PATCH_DIR/kvmd-video.sh" ]; then
@@ -326,6 +543,25 @@ if grep -qE "from 'ffi-napi'|require\('ffi-napi'\)" src/modules/hid/printer.js; 
     die "printer.js 仍引用 ffi-napi"
 fi
 
+# server.js 的 __dirname 补丁：缺失时第一次 HTTP 请求就会崩溃
+grep -q "const __dirname = path.dirname(fileURLToPath(import.meta.url));" \
+    src/server/server.js || die "server.js 的 __dirname 补丁未生效"
+
+# 初始配置必须指向系统 ustreamer，且不能残留 ./lib/<board>/ 的预编译产物
+grep -q '"bin": "ustreamer"' config/app.json \
+    || die "config/app.json 的视频二进制路径补丁未生效"
+if grep -qE '"(bin|recordBin)": "\./lib/' config/app.json; then
+    die "config/app.json 仍指向 lib/<board>/ 下的 aarch64 预编译产物"
+fi
+
+# index.js 必须隔离可选子服务的失败，否则任一子进程退出就会拖垮主进程
+grep -q "isKvmdMainConfigured" src/index.js \
+    || die "index.js 的子服务隔离补丁未生效"
+
+# 默认配置不应启用不存在的 BliSwitch（/dev/ttyUSB0），否则每次全新部署都会报错
+grep -q '"isActive": false' config/switch.json \
+    || die "config/switch.json 的默认关闭补丁未生效"
+
 # device-tree 读取必须容错：这一行在模块加载期执行，
 # 没有 device-tree 的环境会直接崩溃
 grep -q "modelOutput = ''" src/modules/update/app_default_config.js \
@@ -338,6 +574,8 @@ node --check src/common/tool.js || die "tool.js 语法错误"
 node --check src/common/enums.js || die "enums.js 语法错误"
 node --check src/modules/update/app_default_config.js || die "app_default_config.js 语法错误"
 node --check src/modules/hid/printer.js || die "printer.js 语法错误"
+node --check src/server/server.js || die "server.js 语法错误"
+node --check src/index.js || die "index.js 语法错误"
 bash -n lib/kvmd-video.sh || die "kvmd-video.sh 语法错误"
 
 log "全部补丁应用成功"

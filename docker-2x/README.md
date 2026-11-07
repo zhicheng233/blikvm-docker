@@ -1,8 +1,8 @@
 # BliKVM 2.x 容器化（armhf / 通用 ARM）
 
 把 BliKVM **2.x 开源版**（GPL-3.0）封装成特权容器，目标是让非官方 ARM 板
-（本项目首个验证目标：Xunlei OneCloud / Amlogic S5 / meson8b / armv7l）也能跑
-KVM-over-IP，用于**服务器运维**场景。
+（本项目首个验证目标：Xunlei OneCloud / Amlogic S805 / meson8b / armv7l，
+Armbian 26.11 trixie / 内核 6.12）也能跑 KVM-over-IP，用于**服务器运维**场景。
 
 ## 为什么是 2.x 而不是 3.x
 
@@ -30,18 +30,32 @@ KVM-over-IP，用于**服务器运维**场景。
 - 主机内核 `configfs` + `libcomposite` + `usb_f_hid` / `usb_f_mass_storage`
 - 一张 USB UVC 采集卡（本方案不做 CSI 桥 EDID 控制）
 
+**armhf 通用板上不可用的功能**（上游只提供 aarch64 二进制，非本方案的疏漏）：
+
+| 功能 | 依赖 | 通用板表现 |
+|---|---|---|
+| ATX 电源控制 / 风扇 / 外部切换器 | `kvmd-main`（aarch64 ELF） | 启动时跳过，界面相关按钮无效 |
+| WebRTC 视频 | `janus`（aarch64 ELF） | 跳过；用 MJPEG 观看 |
+| BliSwitch 串口切换器 | `/dev/ttyUSB*` 外接设备 | 默认关闭，接入后可手动启用 |
+
+`lib/pi/` 与 `lib/h616/` 下所有预编译产物都是 **aarch64 ELF**（`e_machine=0xb7`），
+armv7l 一个都跑不了，所以这些服务必须跳过而不是硬启。
+
+另外前端 `index.html` 会从 `fonts.gstatic.com` 预加载字体，无外网时会退化到
+系统字体 —— 不影响功能。
+
 ## 目录结构
 
 ```
 docker-2x/
-├── Dockerfile                      # arm32v7/debian + Node 20 + ustreamer，源码直跑
-├── docker-compose.yml              # 特权模式 + 设备直通
+├── Dockerfile                      # 前端原生构建 + arm32v7 源码构建 + 运行镜像
+├── docker-compose.yml              # 特权模式 + /dev、/sys、/lib/modules 直通
 ├── entrypoint.sh                   # 容器启动：环境自检、目录准备、拉起服务
 ├── patches/
 │   ├── apply-patches.sh            # 幂等打补丁脚本，构建期执行
 │   └── kvmd-video.sh               # 替换上游：支持未知板型 + 源分辨率直出
 ├── tests/
-│   ├── patch-logic.test.mjs        # 板型判断与分辨率策略的纯逻辑测试
+│   ├── patch-logic.test.mjs        # 补丁逻辑纯函数测试（49 项）
 │   └── verify-image.sh             # 镜像内冒烟测试（CI 里跑）
 └── README.md
 ```
@@ -62,10 +76,15 @@ docker pull ghcr.io/zhicheng233/blikvm-2x-armhf:2.x-armhf
 zstd -d blikvm-2x-armhf.tar.zst | docker load
 ```
 
-CI 每次构建都会先跑冒烟测试再推送，验证内容包括：四个补丁确实落进镜像、
-补丁后的 JS 仍能通过 `node --check`、六个原生模块是 armhf ELF 且能实际调用
-（bcrypt 真算一次哈希、serialport 真枚举串口、koffi 真打开 `libxkbcommon` 并调用）、
-ustreamer 可执行、入口脚本可执行。任一失败则不推送镜像。
+CI 每次构建都会先跑冒烟测试再推送，验证内容包括：
+
+- 8 个补丁确实落进镜像；补丁后的 JS 仍能通过 `node --check`
+- 六个原生模块是 armhf ELF 且能实际调用（bcrypt 真算一次哈希、
+  serialport 真枚举串口、koffi 真打开 `libxkbcommon` 并调用）
+- 前端产物 `src/server/dist/index.html` 存在（缺失会让整个 Web 界面 404）
+- `ustreamer` / `modprobe` / `v4l2-ctl` / `ffmpeg` 可用；入口脚本可执行
+
+任一失败则不推送镜像。
 
 自行构建（需要 armhf 环境或 QEMU binfmt）：
 
@@ -81,12 +100,27 @@ cd docker-2x
 docker compose up -d
 ```
 
-访问 `https://<host-ip>/`，默认账号见上游文档。
+访问 `https://<host-ip>/`。默认账号 `admin` / `admin`（首次登录后请立刻修改）。
 
+外层 `docker-compose.yml` 已经处理了三件容易漏掉的事：
+
+- `--privileged` + `/dev`：采集卡、UDC、loop 设备
+- `/sys` 与 `/lib/modules:ro`：USB gadget 需要宿主的 configfs 与模块目录
+- 容器镜像带 `kmod`，可在容器内 `modprobe libcomposite`
+
+宿主侧建议先确认（否则 HID/MSD 建不出来）：
+
+```bash
+modprobe libcomposite
+ls /sys/class/udc          # 必须非空
+ls /dev/video*             # 插上采集卡之后才有
+```
 
 ## 打了哪些补丁
 
-上游代码把硬件型号写死了，非官方板直接失效；另有一个 FFI 依赖在新版 Node 上根本编译不出来。本方案改四处：
+上游代码把硬件型号写死了，非官方板直接失效；另有一个 FFI 依赖在新版 Node 上
+根本编译不出来；还有几处只有在「直接跑源码而不是 pkg 二进制」时才会暴露。
+本方案共 8 处，全部由 `patches/apply-patches.sh` 在构建期完成。
 
 ### 1. `lib/kvmd-video.sh` —— 整份替换
 
@@ -98,6 +132,9 @@ docker compose up -d
 - 遍历 `/dev/video*`，选第一个支持 MJPEG 的节点
 - **默认不传 `--resolution`**，按源分辨率直出
 - 编码器默认 `CPU`（MJPEG 软编）
+- 传入的 `bin` 是命令名（`ustreamer`）时用 `command -v` 解析成绝对路径
+- **没有采集设备时不退出**，每 10 秒重试；插入采集卡后自动出流
+- 日志走 stderr（走 stdout 会被 `$(...)` 当成设备名捕获）
 
 ### 2. `src/common/tool.js` —— 板型兜底
 
@@ -111,10 +148,6 @@ docker compose up -d
 
 - 未知板型返回 `'generic'` 而非 `'none'`（后者会让 `lib/none/ustreamer.bin` 路径不存在）
 - 默认分辨率改为 `"native"`，配合视频脚本直出
-
-补丁由 `patches/apply-patches.sh` 在构建期执行，具备幂等性：
-重复执行会跳过已打的补丁；上游结构变化导致补丁打不上时会**立即报错退出**，
-不会悄悄产出行为错误的镜像。
 
 ### 4. `src/modules/hid/printer.js` —— FFI 后端换成 koffi
 
@@ -139,28 +172,99 @@ error: invalid conversion from 'napi_status (*)(node_api_basic_env, uv_loop_s**)
 `cpu-features` 是 `ssh2` 的可选加速器，编译失败会被 `ssh2` 静默忽略，
 因此不列入 `npm rebuild`（列入反而会让构建非零退出）。
 
+### 5. `src/server/server.js` —— 补回 ESM 下缺失的 `__dirname`
+
+上游用 `pkg` 把源码打包成 CommonJS，所以这里直接用了 CJS 的 `__dirname`
+定位前端静态目录。本方案以 ESM 跑源码，该全局不存在 —— 第一次 HTTP 请求
+（`getRootPath()`）就会 `ReferenceError` 并终止进程。
+
+补丁从 `import.meta.url` 还原：
+
+```js
+import { fileURLToPath } from 'url';
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+```
+
+### 6. `config/app.json` —— 初始配置里的二进制路径
+
+这是最容易漏的一处：`entrypoint` 首次启动就把 `config/*.json` 复制到
+`/data/config`，而 `app_default_config.js` 只在版本升级时补缺失字段。
+所以**真正生效的初始值来自这个文件**，它把 ustreamer/janus/kvmd-main
+全指向 `./lib/pi/...`（aarch64）。
+
+改为：`video.bin=ustreamer`、`recordBin=''`、`resolution=native`、
+`janus.bin=''`、`kvmd.bin=''`、`atx.isActive=false`。
+
+### 7. `config/switch.json` —— 默认不启用 BliSwitch
+
+默认配置 `kvmSwitch.isActive=true` 且指向 `/dev/ttyUSB0`。通用板没有这个串口，
+`startSwitch()` 会先初始化失败报一条 `Switch path ... doesn't exist` 再自己
+关掉。初始值直接置 `false`，需要外接切换器时在界面上重新启用。
+
+### 8. `src/index.js` —— 可选子服务的失败不能拖垮主进程
+
+上游把 video / kvmd-main / janus / ATX 都当必选服务：
+
+- `startService()` 多数调用点没有 `.catch()`，任一子进程以 code 1 退出就会
+  产生未处理的 Promise rejection，Node 20 直接终止进程
+- `janus` / `kvmd-main` 在通用板上没有可执行文件，`spawn('')` 会**同步**抛
+  `ERR_INVALID_ARG_VALUE`
+- ATX 无条件 `fs.watch('/dev/shm/blikvm/atx')`，该文件由 kvmd-main 创建，
+  不存在时抛 `ENOENT` 同样终止进程
+
+补丁只做两件事：给异步启动补 `.catch()`；在 `bin` 为空时**跳过**该服务而非
+调用它。不改变任何业务逻辑。
+
+### 幂等与失败策略
+
+补丁脚本具备幂等性：重复执行会跳过已打的补丁；上游结构变化导致补丁打不上时
+会**立即报错退出**，不会悄悄产出行为错误的镜像。每个补丁块都配有对应的
+`grep`/`node --check` 校验。
+
+## 前端产物
+
+`src/server/dist` 不是上游仓库自带的（上游是 pkg 打进去的），必须自己构建。
+`Dockerfile` 里单独设了一个前端阶段：
+
+- 仓库：`blikvm/blikvm-web-client`
+- 固定 commit：`7062dc33`（2025-12-16）—— 这是**最后一个 Vue 版**；
+  之后该仓库被改成了面向 RV1126B 3.0.3 的 WebRTC demo，与本后端不匹配
+- `FROM --platform=$BUILDPLATFORM`：前端是纯 JS 产物，与目标架构无关。
+  在 armhf QEMU 里装几百 MB 依赖会慢到不可用，甚至把 1GB 的构建机拖死
+- 构建完断言 `dist/index.html` 存在，然后 `COPY` 到 `/opt/blikvm/src/server/dist`
+
 ## 验证状态
 
 | 项 | 状态 |
 |---|---|
-| 补丁逻辑（板型判断 / 分辨率策略 / koffi 替换） | ✅ 27/27 通过（`node --test tests/`） |
-| 补丁脚本幂等性 | ✅ 重复执行正确跳过 |
+| 补丁逻辑（板型 / 分辨率 / 二进制路径 / koffi / ESM / 配置 / 子服务） | ✅ 49/49 通过（`node --test tests/`） |
+| 补丁脚本幂等性 | ✅ 真机对镜像源码重复执行两遍，第二遍全部跳过 |
 | 打补丁后 JS 语法 | ✅ `node --check` 通过 |
 | 原生模块编译可行性（armhf + Node 20） | ✅ 探针实测：`unix-dgram`/`ref-napi` 可编，`ffi-napi`/`cpu-features` 不可编 |
 | 镜像构建（GitHub Actions, linux/arm/v7） | ✅ 构建通过 |
-| 镜像内冒烟测试 | ✅ 补丁 / ELF 架构 / 原生模块调用 / 视频后端 / 入口 |
-| 容器启动（有硬件） | ⏳ 待验证 |
-| 真机 MJPEG 帧率 / CPU 占用 | ⏳ 待验证 |
-| HID 键鼠与 MSD 虚拟介质 | ⏳ 待验证 |
+| 镜像内冒烟测试 | ✅ 补丁 / ELF 架构 / 原生模块调用 / 前端 dist / 视频后端 / 入口 |
+| 容器启动（OneCloud 真机） | ✅ `Up (healthy)`，日志无 ERROR |
+| Web 界面 | ✅ `https://<ip>/` 200，静态资源 200，80 自动跳 443 |
+| 登录 | ✅ `POST /api/login` 200，JWT 签发、bcrypt 校验、`/api/auth/state` 200 |
+| HID gadget | ✅ `/dev/hidg0/1/2` 全部打开，`HID already running` |
+| 无采集卡时的行为 | ✅ 视频服务等待不退出，其余功能正常 |
+| MJPEG 实际出流 / 帧率 / CPU | ⏳ 待插采集卡验证 |
+| HID 键盘鼠标向目标机实际输入 | ⏳ 待验证 |
+| MSD 虚拟介质挂载 | ⏳ 待验证 |
+| ATX / 风扇 / BliSwitch | ❌ armhf 不可用（kvmd-main 为 aarch64） |
 
 尚未在真机上验证的部分会明确标注，不提前声称可用。
 
-构建期已经抓到并修掉的两个真实缺陷，都出在运行阶段而不是补丁逻辑：
+真机迭代中抓到并修掉的运行时缺陷（都只在「直接跑源码」时才暴露）：
 
-- `evdev` 被 `src/index.js` 无条件间接 import，缺失会让服务直接崩溃
-  （不是可选项，必须一起编译）
-- 运行镜像缺 `udevadm`，`SerialPort.list()` 会失败，串口/ATX 功能不可用
-
+- `server.js` 的 `__dirname` 在 ESM 下不存在 → 首个请求即崩
+- `config/app.json` 的默认二进制路径指向 aarch64 产物 → 视频永远起不来
+- `index.js` 没有隔离子服务失败 → 缺 janus/kvmd-main 时整体退出
+- ATX 无条件监视 kvmd-main 的状态文件 → 文件不存在时 `ENOENT` 杀进程
+- `kvmd-video.sh` 用 `[ -x ]` 检查命令名 → 误报「ustreamer 不可执行」；
+  日志写 stdout → 被 `$(pick_capture_device)` 当成设备名
+- 运行镜像缺 `udevadm` → `SerialPort.list()` 失败
+- `evdev` 被无条件 import → 缺失直接崩溃
 
 ## 设计要点
 
@@ -201,14 +305,15 @@ Debian armhf 的 `ustreamer` 不含 x264（编码器只有 CPU/HW/M2M-*/NOOP）�
 
 `Dockerfile` 的 `BLIKVM_REF` 与 workflow 的 `UPSTREAM_REF`
 都固定到 `blikvm-web-server` 的提交 `cecede74`（2025-12-18，最后一个非 alpha 的
-master 快照）。上游若更新，需要同步改这两处并重新验证补丁是否仍能打上。
-
+master 快照）。前端固定到 `blikvm-web-client` 的 `7062dc33`（2025-12-16）。
+上游若更新，需要同步改这几处并重新验证补丁是否仍能打上。
 
 ## 与上游的关系
 
 - 本目录是**适配层**，不含上游源码；构建时从 GitHub 拉取并打补丁
-- 补丁只改「板型判断」「分辨率策略」「FFI 后端」，不改变业务逻辑
-- 上游更新时，若 `kvmd-video.sh` 或 `printer.js` 结构变化，补丁需要同步调整
+- 补丁只改「板型判断」「分辨率策略」「二进制路径」「FFI 后端」「可选服务的
+  失败隔离」，不改变业务逻辑
+- 上游更新时，若相关文件结构变化，补丁会 fail closed，需要同步调整
 
 ## 许可证
 

@@ -1,6 +1,7 @@
 // 验证补丁逻辑：模拟 OneCloud 环境（无 device-tree 匹配、有 /dev/video*）
 // 这里只测试纯逻辑分支，不依赖真实硬件。
 import fs from 'fs';
+import { spawn } from 'node:child_process';
 
 const HardwareType = { UNKNOWN: 0, PI4B: 1, CM4: 2, MangoPi: 3, BliKVMV5CM4: 4, GENERIC: 5 };
 
@@ -211,6 +212,155 @@ for (const c of printerChecks) {
   if (!c.ok) failed++;
   console.log(`${c.ok ? 'PASS' : 'FAIL'}  printer.js ${c.desc}`);
 }
+
+// ---------------------------------------------------------------------------
+// server.js：ESM 下没有 __dirname
+//
+// 上游用 pkg 打包成 CJS，所以 src/server/server.js 直接用了 CJS 的 __dirname
+// 定位前端静态目录。本方案以 ESM 跑源码，该全局不存在，getRootPath() 首次
+// 被调用就 ReferenceError。补丁从 import.meta.url 还原它。
+// ---------------------------------------------------------------------------
+const SERVER_FIXTURE = `import express from 'express';
+import path from 'path';
+
+function getRootPath() {
+  return __dirname;
+}
+`;
+
+function patchServer(s) {
+  const anchor = "import path from 'path';";
+  const inject = `import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));`;
+  if (s.includes('fileURLToPath(import.meta.url)')) return s;
+  if (!s.includes(anchor)) throw new Error('path import 锚点缺失');
+  return s.replace(anchor, inject);
+}
+
+const patchedServer = patchServer(SERVER_FIXTURE);
+const serverChecks = [
+  { desc: '注入 fileURLToPath', ok: patchedServer.includes("import { fileURLToPath } from 'url';") },
+  { desc: '还原 __dirname',     ok: patchedServer.includes('const __dirname = path.dirname(fileURLToPath(import.meta.url));') },
+  { desc: '保留原有逻辑',       ok: patchedServer.includes('return __dirname;') },
+  { desc: '幂等',               ok: patchServer(patchedServer) === patchedServer },
+  { desc: '锚点缺失时抛错',     ok: (() => { try { patchServer('no anchor here'); return false; } catch { return true; } })() },
+];
+console.log('');
+for (const c of serverChecks) {
+  if (!c.ok) failed++;
+  console.log(`${c.ok ? 'PASS' : 'FAIL'}  server.js ${c.desc}`);
+}
+
+// ---------------------------------------------------------------------------
+// config/app.json：初始配置里的二进制路径
+//
+// 这是最容易漏的一处：entrypoint 首次启动就把 config/*.json 复制到
+// /data/config，而 app_default_config.js 只在版本升级时补缺失字段。
+// 所以真正生效的初始值来自 config/app.json 本身。
+// ---------------------------------------------------------------------------
+function patchAppConfig(cfg) {
+  const out = JSON.parse(JSON.stringify(cfg));
+  out.video.bin = 'ustreamer';
+  out.video.recordBin = '';
+  out.video.resolution = 'native';
+  out.janus = { bin: '', configsFolder: '', pluginsFolder: '' };
+  out.kvmd = { bin: '' };
+  out.atx.isActive = false;
+  return out;
+}
+
+const APP_FIXTURE = {
+  version: 10,
+  deviceVersion: 'BliKVM 2.x',
+  video: { bin: './lib/pi/ustreamer.bin', recordBin: './lib/pi/record', resolution: '1920x1080' },
+  janus: { bin: './lib/pi/janus', configsFolder: './lib/pi/janus-configs', pluginsFolder: './lib/pi/janus-plugins' },
+  kvmd: { bin: './lib/pi/kvmd-main' },
+  atx: { isActive: true },
+};
+
+const patchedCfg = patchAppConfig(APP_FIXTURE);
+const cfgJson = JSON.stringify(patchedCfg);
+const appChecks = [
+  { desc: '视频用系统 ustreamer',   ok: patchedCfg.video.bin === 'ustreamer' },
+  { desc: '默认分辨率直出',         ok: patchedCfg.video.resolution === 'native' },
+  { desc: '关闭录制二进制',         ok: patchedCfg.video.recordBin === '' },
+  { desc: 'janus 置空',             ok: patchedCfg.janus.bin === '' },
+  { desc: 'kvmd-main 置空',         ok: patchedCfg.kvmd.bin === '' },
+  { desc: 'ATX 标记为不可用',       ok: patchedCfg.atx.isActive === false },
+  { desc: '无 lib/<board>/ 残留',   ok: !/"(bin|recordBin)": "\.\/lib\//.test(cfgJson) },
+  { desc: '不修改输入对象',         ok: APP_FIXTURE.video.bin === './lib/pi/ustreamer.bin' },
+];
+console.log('');
+for (const c of appChecks) {
+  if (!c.ok) failed++;
+  console.log(`${c.ok ? 'PASS' : 'FAIL'}  config/app.json ${c.desc}`);
+}
+
+// 默认配置里的 BliSwitch 指向 /dev/ttyUSB0；通用板没有这个串口，
+// 每次全新部署都会先初始化失败报错、再把自己关闭。初始值就应为关闭。
+function patchSwitchConfig(cfg) {
+  const out = JSON.parse(JSON.stringify(cfg));
+  out.kvmSwitch.isActive = false;
+  return out;
+}
+
+const SWITCH_FIXTURE = { version: 1, kvmSwitch: { isActive: true, activeSwitchId: 1, items: [] } };
+const patchedSwitch = patchSwitchConfig(SWITCH_FIXTURE);
+const switchChecks = [
+  { desc: '默认关闭 BliSwitch', ok: patchedSwitch.kvmSwitch.isActive === false },
+  { desc: '保留 activeSwitchId', ok: patchedSwitch.kvmSwitch.activeSwitchId === 1 },
+  { desc: '不修改输入对象',     ok: SWITCH_FIXTURE.kvmSwitch.isActive === true },
+];
+console.log('');
+for (const c of switchChecks) {
+  if (!c.ok) failed++;
+  console.log(`${c.ok ? 'PASS' : 'FAIL'}  config/switch.json ${c.desc}`);
+}
+
+// ---------------------------------------------------------------------------
+// index.js：可选子服务
+//
+// 通用板上 janus / kvmd-main 没有可执行文件（上游只给 aarch64 二进制）。
+// 上游对这些服务既没有 .catch()，ATX 又无条件 fs.watch 一个由 kvmd-main
+// 创建的状态文件。任一失败都会成为未处理 rejection，Node 20 直接退出。
+// ---------------------------------------------------------------------------
+function isKvmdMainConfigured(cfg) {
+  try {
+    return Boolean(cfg && cfg.kvmd && cfg.kvmd.bin);
+  } catch (e) {
+    return false;
+  }
+}
+
+const kvmdCases = [
+  { desc: '通用板（bin 为空）跳过', cfg: { kvmd: { bin: '' } },  want: false },
+  { desc: 'Pi（有 bin）启用',       cfg: { kvmd: { bin: './lib/pi/kvmd-main' } }, want: true },
+  { desc: '缺 kvmd 段跳过',         cfg: {},                      want: false },
+  { desc: '配置损坏按不可用处理',   cfg: null,                    want: false },
+];
+console.log('');
+for (const c of kvmdCases) {
+  let got;
+  try { got = isKvmdMainConfigured(c.cfg); } catch { got = false; }
+  const ok = got === c.want;
+  if (!ok) failed++;
+  console.log(`${ok ? 'PASS' : 'FAIL'}  index.js ${c.desc.padEnd(20)} -> ${got ? '启动' : '跳过'}`);
+}
+
+// spawn('') 会同步抛 ERR_INVALID_ARG_VALUE，所以空 bin 必须在调用前拦下，
+// 不能指望 .catch() 兜底（异常发生在 Promise executor 里）。
+const emptySpawnThrows = (() => {
+  try {
+    spawn('');
+    return false;
+  } catch (e) {
+    return e.code === 'ERR_INVALID_ARG_VALUE';
+  }
+})();
+if (!emptySpawnThrows) failed++;
+console.log(`${emptySpawnThrows ? 'PASS' : 'FAIL'}  index.js spawn('') 确实同步抛错（故需前置跳过）`);
 
 console.log(`\n${failed === 0 ? '全部通过' : failed + ' 项失败'}`);
 process.exit(failed === 0 ? 0 : 1);

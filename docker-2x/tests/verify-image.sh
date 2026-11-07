@@ -61,12 +61,41 @@ else
     ok "printer.js 无 ffi-napi 引用"
 fi
 
+# server.js 在 ESM 下没有 __dirname；不补的话第一次 HTTP 请求就 ReferenceError
+grep -q "const __dirname = path.dirname(fileURLToPath(import.meta.url));" \
+    "$APP_DIR/src/server/server.js" \
+    && ok "server.js 已补回 __dirname" || report "server.js 缺 __dirname 定义"
+
+# index.js 必须能承受可选子服务失败（视频/ATX/janus 在通用板上并不总可用）
+grep -q "isKvmdMainConfigured" "$APP_DIR/src/index.js" \
+    && ok "index.js 已隔离子服务失败" || report "index.js 未隔离子服务失败"
+
+# 初始配置必须指向系统 ustreamer，而不是 lib/<board>/ 下的 aarch64 产物
+if grep -q '"bin": "ustreamer"' "$APP_DIR/config/app.json"; then
+    ok "config/app.json 指向系统 ustreamer"
+else
+    report "config/app.json 未指向系统 ustreamer"
+fi
+if grep -qE '"(bin|recordBin)": "\./lib/' "$APP_DIR/config/app.json"; then
+    report "config/app.json 仍指向 lib/<board>/ 的 aarch64 产物"
+else
+    ok "config/app.json 无 lib/<board>/ 残留"
+fi
+
+# 默认不启用不存在的 BliSwitch（/dev/ttyUSB0），否则全新部署必报一次错误
+if grep -q '"isActive": false' "$APP_DIR/config/switch.json"; then
+    ok "config/switch.json 默认关闭 BliSwitch"
+else
+    report "config/switch.json 仍默认启用 BliSwitch"
+fi
+
 # ---------------------------------------------------------------------------
 # 2. 补丁后的 JS 必须仍然可解析
 # ---------------------------------------------------------------------------
 echo "--- 语法 ---"
 
-for f in src/common/enums.js src/common/tool.js src/modules/update/app_default_config.js src/modules/hid/printer.js; do
+for f in src/common/enums.js src/common/tool.js src/modules/update/app_default_config.js \
+         src/modules/hid/printer.js src/server/server.js src/index.js; do
     if node --check "$APP_DIR/$f" 2>/dev/null; then
         ok "$f"
     else
@@ -276,6 +305,10 @@ command -v v4l2-ctl >/dev/null && ok "v4l2-ctl 存在" || report "缺少 v4l2-ct
 command -v jq >/dev/null && ok "jq 存在" || report "缺少 jq"
 command -v ffmpeg >/dev/null && ok "ffmpeg 存在" || report "缺少 ffmpeg"
 
+# gadget.sh 需要 modprobe 才能加载 libcomposite / usb_f_mass_storage；
+# 宿主没预加载时，容器必须能自己拉起，否则 USB gadget 建不出来
+command -v modprobe >/dev/null && ok "modprobe 存在" || report "缺少 kmod/modprobe"
+
 # ---------------------------------------------------------------------------
 # 6. 入口与配置
 # ---------------------------------------------------------------------------
@@ -295,6 +328,14 @@ else
 fi
 
 [ -f "$APP_DIR/src/index.js" ] && ok "src/index.js 存在" || report "缺少 src/index.js"
+
+# 前端产物：server.js 的 getRootPath()（ESM 下 = src/server 目录）下必须有 dist，
+# 否则 express.static 全部 404，登录页都打不开。空目录也算失败。
+if [ -s "$APP_DIR/src/server/dist/index.html" ]; then
+    ok "前端 dist 存在 ($(find "$APP_DIR/src/server/dist" -type f | wc -l) 个文件)"
+else
+    report "缺少前端产物 src/server/dist/index.html"
+fi
 
 echo
 if [ "$rc" -eq 0 ]; then

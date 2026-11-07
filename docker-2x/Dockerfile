@@ -12,6 +12,42 @@
 #   docker build --build-arg BLIKVM_REF=<commit> -t blikvm:2.x-armhf .
 
 # ---------------------------------------------------------------------------
+# 前端阶段：在构建机原生架构上编译，不跑 QEMU
+# ---------------------------------------------------------------------------
+# 上游 server_app 里的 dist 是 pkg 打包进二进制的；本方案直接跑源码，
+# 需要一个真实的 dist 才能出 Web 界面。前端是纯 JS 产物（Vue 3 + Vite），
+# 与目标架构无关，因此固定在 $BUILDPLATFORM 上编译：
+# 在 armhf QEMU 里装几百 MB 的前端依赖会慢到不可用，甚至把 1GB 的构建机拖死。
+#
+# 版本对齐：blikvm-web-server 固定 commit 的日期是 2025-12-18，
+# blikvm-web-client 在 2025-12-16 之后就把 Vue 客户端换成了 WebRTC demo，
+# 所以这里锁到最后那个 Vue 版本，与后端 API 同代。
+FROM --platform=$BUILDPLATFORM node:22-bookworm-slim AS frontend
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG WEB_CLIENT_REPO=https://github.com/blikvm/blikvm-web-client.git
+ARG WEB_CLIENT_REF=7062dc335f572162ffed4ffdfa9fd6622d62807a
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /web
+RUN git init --quiet . \
+    && git remote add origin "$WEB_CLIENT_REPO" \
+    && { git fetch --depth 1 origin "$WEB_CLIENT_REF" \
+         || git fetch origin "$WEB_CLIENT_REF"; } \
+    && git checkout --quiet --detach FETCH_HEAD
+
+# husky 的 prepare 钩子在没有 .git 钩子的构建环境里会失败，与产物无关
+ENV HUSKY=0
+RUN npm ci --no-audit --no-fund \
+    && npm run build
+
+# 构建产物必须存在：缺失说明前端构建悄悄失败了，不能在最后才暴露
+RUN test -f /web/dist/index.html
+
+# ---------------------------------------------------------------------------
 # 构建阶段：拉源码 + 打补丁
 # ---------------------------------------------------------------------------
 FROM arm32v7/debian:trixie-slim AS builder
@@ -61,7 +97,7 @@ RUN /opt/patches/apply-patches.sh /src/blikvm
 #   evdev       - HID passthrough；src/index.js 无条件 import，缺失会导致启动崩溃
 #   unix-dgram  - ATX 电源控制；src/server/api/atx.route.js 直接 import
 #
-# cpu-features 是 ssh2 的可选加速器，编译失败不影晌功能，故不列入
+# cpu-features 是 ssh2 的可选加速器，编译失败不影响功能，故不列入
 # （列入反而会让 npm rebuild 非零退出而中断构建）。
 #
 # ffi-napi 在 Node 20 上无法编译（NAPI 签名变更），且已停止维护；
@@ -96,6 +132,8 @@ ARG DEBIAN_FRONTEND=noninteractive
 #   tesseract-ocr    - OCR 功能
 #   libxkbcommon0    - printer.js 通过 koffi 绑定它做 xkb_utf32_to_keysym；
 #                      该绑定在模块加载期执行，缺失会让启动直接失败
+#   kmod             - 提供 modprobe；lib/hid/gadget.sh 用它加载 libcomposite
+#                      与 usb_f_mass_storage。宿主未预加载时需要容器自己拉起
 #   bash iproute2 util-linux mount - 上游脚本依赖的常用工具
 RUN apt-get update && apt-get install -y --no-install-recommends \
         nodejs \
@@ -108,6 +146,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libbsd0 \
         libudev1 \
         udev \
+        kmod \
         ffmpeg \
         tesseract-ocr \
         libxkbcommon0 \
@@ -123,6 +162,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # 原生 Node 模块由构建阶段编译完成，随源码一起复制
 WORKDIR /opt/blikvm
 COPY --from=builder /src/blikvm /opt/blikvm
+
+# Web 前端静态资源。server.js 的 getRootPath() 在 ESM 下解析为
+# <本文件所在目录>，即 /opt/blikvm/src/server，前端必须落在这个 dist 下。
+COPY --from=frontend /web/dist /opt/blikvm/src/server/dist
 
 # 容器内的运行目录布局（与上游 /mnt 结构对齐，减少脚本改动）
 RUN mkdir -p \
